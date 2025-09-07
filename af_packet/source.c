@@ -163,6 +163,26 @@ struct udp_opt_sha256
 #define UOPT_KIND_SHA256 1
 #define UOPT_HDR_LEN (sizeof(struct udp_opt_sha256))
 
+// ---- per-flow key lookup (returns a static 64B key for now) ----
+static const unsigned char *
+key_lookup(const struct in_addr *saddr,
+           const struct in_addr *daddr,
+           uint16_t sport, uint16_t dport,
+           size_t *key_len_out)
+{
+    (void)saddr;
+    (void)daddr;
+    (void)sport;
+    (void)dport; // unused for now
+
+    static const unsigned char KEY[] =
+        "thisisaverysecure64bytehmacauthenticationkey12345678901234567890";
+    // KEY is 64 bytes (no trailing NUL is used in the hash)
+    if (key_len_out)
+        *key_len_out = sizeof(KEY) - 0; // treat full 64 bytes as key
+    return KEY;
+}
+
 // ---- core transformation: zero IP csum, hash headers, append TLV, fix lengths & checksums
 // Returns new frame length on success, 0 to skip.
 static size_t process_packet(const struct parsed *P, const uint8_t *in, size_t in_len,
@@ -184,10 +204,20 @@ static size_t process_packet(const struct parsed *P, const uint8_t *in, size_t i
     memcpy(iptmp, ip, P->ihl);
     iptmp[10] = iptmp[11] = 0;
 
-    // 2) SHA-256 over (IP header with zeroed checksum) + (UDP header 8B)
+    // --- NEW: look up the per-flow key and hash key||headers ---
+    struct in_addr src_ip, dst_ip;
+    memcpy(&src_ip, ip + 12, 4);
+    memcpy(&dst_ip, ip + 16, 4);
+
+    size_t key_len = 0;
+    const unsigned char *key = key_lookup(&src_ip, &dst_ip, P->sport, P->dport, &key_len);
+
+    // 2) SHA-256 over: key || (IP header, zeroed csum) || (UDP header 8B)
     uint8_t digest[32];
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
+    if (key && key_len)
+        SHA256_Update(&ctx, key, key_len);
     SHA256_Update(&ctx, iptmp, P->ihl);
     SHA256_Update(&ctx, udp, 8);
     SHA256_Final(digest, &ctx);
