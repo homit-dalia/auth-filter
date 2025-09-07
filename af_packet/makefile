@@ -1,4 +1,4 @@
 all:
-	gcc -O2 -Wall -Wextra -o af_print source.c
-	mv af_print /tmp/
-	sudo /tmp/af_print
+	gcc -O2 -Wall -Wextra -o af_reinject source.c -lcrypto
+	mv af_reinject /tmp/
+	sudo /tmp/af_reinject

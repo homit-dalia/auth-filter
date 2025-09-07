@@ -7,6 +7,7 @@
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <openssl/sha.h> // <-- OpenSSL SHA-256
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,15 +20,11 @@ static const char *TX_IFACE = "eno1"; // transmit reinjected copies here
 static const char *DST_IP_S = "192.168.200.1";
 static const uint16_t DST_PORT = 9999;
 
-static const uint8_t MARK_BYTES[] = {'R', 'I', 'N', 'J'}; // payload marker
-#define MARK_LEN (sizeof(MARK_BYTES))
-
 // -------- checksum helpers --------
 static uint16_t ip_checksum(const void *vdata, size_t length)
 {
     const uint8_t *data = vdata;
     uint32_t acc = 0xffff;
-
     for (size_t i = 0; i + 1 < length; i += 2)
     {
         uint16_t word;
@@ -49,25 +46,22 @@ static uint16_t ip_checksum(const void *vdata, size_t length)
 
 static uint16_t udp_checksum(const uint8_t *iphdr, const uint8_t *udphdr, size_t udp_len)
 {
-    // Pseudo-header + UDP header + payload
     uint32_t acc = 0;
-
-    // Source and dest IP
+    // pseudo header: src/dst
     for (int i = 12; i < 20; i += 2)
     {
         acc += (iphdr[i] << 8) | iphdr[i + 1];
         if (acc > 0xffff)
             acc -= 0xffff;
     }
-    // Protocol + UDP length
-    acc += 17; // UDP protocol
+    // proto + length
+    acc += 17;
     if (acc > 0xffff)
         acc -= 0xffff;
     acc += udp_len;
     acc = (acc & 0xffff) + (acc >> 16);
     acc = (acc & 0xffff) + (acc >> 16);
-
-    // UDP header + payload bytes
+    // udp header + payload
     for (size_t i = 0; i + 1 < udp_len; i += 2)
     {
         uint16_t word = (udphdr[i] << 8) | udphdr[i + 1];
@@ -109,9 +103,8 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
         return 0;
     uint16_t et = (f[12] << 8) | f[13];
     size_t l2 = 14;
-
     if (et == 0x8100 || et == 0x88A8)
-    { // VLAN/QinQ
+    { // VLAN/QinQ (single tag handled)
         if (n < 18)
             return 0;
         et = (f[16] << 8) | f[17];
@@ -119,7 +112,6 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     }
     if (et != 0x0800)
         return 0; // IPv4
-
     if (n < (ssize_t)(l2 + 20))
         return 0;
     uint8_t ihl = (f[l2] & 0x0F) * 4;
@@ -133,7 +125,6 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     memcpy(&dst_ip, f + l2 + 16, 4);
     char dst_ip_s[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &dst_ip, dst_ip_s, sizeof(dst_ip_s));
-
     if (strcmp(dst_ip_s, DST_IP_S) != 0 || dport != DST_PORT)
         return 0;
 
@@ -158,13 +149,84 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     return 1;
 }
 
-static int payload_has_marker(const struct parsed *P, const uint8_t *frame)
+// -------- our custom "UDP option" TLV (appended to payload) --------
+// Layout: "UOPT" (4 bytes) | kind=1 (1B) | len=32 (1B) | digest[32]
+#pragma pack(push, 1)
+struct udp_opt_sha256
 {
-    int pay_len = (int)P->udp_len - 8;
-    if (pay_len < (int)MARK_LEN)
+    char magic[4];      // 'U','O','P','T'
+    uint8_t kind;       // 1 = SHA256
+    uint8_t len;        // length of 'digest' (32)
+    uint8_t digest[32]; // SHA-256(IP hdr w/zeroed csum + UDP hdr)
+};
+#pragma pack(pop)
+#define UOPT_KIND_SHA256 1
+#define UOPT_HDR_LEN (sizeof(struct udp_opt_sha256))
+
+// ---- core transformation: zero IP csum, hash headers, append TLV, fix lengths & checksums
+// Returns new frame length on success, 0 to skip.
+static size_t process_packet(const struct parsed *P, const uint8_t *in, size_t in_len,
+                             uint8_t *out, size_t out_cap)
+{
+    // Copy original frame
+    if (in_len > out_cap)
         return 0;
-    const uint8_t *tail = frame + P->pay_off + pay_len - MARK_LEN;
-    return (memcmp(tail, MARK_BYTES, MARK_LEN) == 0);
+    memcpy(out, in, in_len);
+    size_t out_len = in_len;
+
+    uint8_t *ip = out + P->l3_off;
+    uint8_t *udp = out + P->l4_off;
+
+    // 1) Reset IP header checksum (for hashing and later recompute)
+    uint8_t iptmp[60]; // max IPv4 header
+    if (P->ihl > sizeof(iptmp))
+        return 0;
+    memcpy(iptmp, ip, P->ihl);
+    iptmp[10] = iptmp[11] = 0;
+
+    // 2) SHA-256 over (IP header with zeroed checksum) + (UDP header 8B)
+    uint8_t digest[32];
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, iptmp, P->ihl);
+    SHA256_Update(&ctx, udp, 8);
+    SHA256_Final(digest, &ctx);
+
+    // 3) Append our UDP option TLV to payload
+    if (out_len + UOPT_HDR_LEN > out_cap)
+        return 0;
+    struct udp_opt_sha256 opt;
+    memcpy(opt.magic, "UOPT", 4);
+    opt.kind = UOPT_KIND_SHA256;
+    opt.len = 32;
+    memcpy(opt.digest, digest, 32);
+    memcpy(out + out_len, &opt, UOPT_HDR_LEN);
+    out_len += UOPT_HDR_LEN;
+
+    // Update IP total length & UDP length
+    uint16_t new_ip_tot = (uint16_t)(P->ip_tot_len + UOPT_HDR_LEN);
+    uint16_t new_udp_len = (uint16_t)(P->udp_len + UOPT_HDR_LEN);
+    ip[2] = (new_ip_tot >> 8) & 0xFF;
+    ip[3] = new_ip_tot & 0xFF;
+    udp[4] = (new_udp_len >> 8) & 0xFF;
+    udp[5] = new_udp_len & 0xFF;
+
+    // 4) Mark DSCP=EF (preserve ECN) and set TTL=63 for reinjected copies
+    ip[1] = (ip[1] & 0x03) | 0xB8;
+    ip[8] = 63;
+
+    // Recompute checksums
+    ip[10] = ip[11] = 0;
+    uint16_t ip_chk = ip_checksum(ip, P->ihl);
+    ip[10] = (ip_chk >> 8) & 0xFF;
+    ip[11] = ip_chk & 0xFF;
+
+    udp[6] = udp[7] = 0;
+    uint16_t udp_chk = udp_checksum(ip, udp, new_udp_len);
+    udp[6] = (udp_chk >> 8) & 0xFF;
+    udp[7] = udp_chk & 0xFF;
+
+    return out_len;
 }
 
 int main(void)
@@ -205,7 +267,6 @@ int main(void)
         perror("socket tx");
         return 1;
     }
-
     struct sockaddr_ll txbind = {
         .sll_family = AF_PACKET,
         .sll_protocol = htons(ETH_P_ALL),
@@ -216,9 +277,11 @@ int main(void)
         perror("bind tx");
         return 1;
     }
-    int snd = 4 * 1024 * 1024; // 4 MB
+
+    int snd = 4 * 1024 * 1024; // 4 MB buffer for TX
     setsockopt(tx, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
-    printf("[reinjector] RX=%s (ifb mirror of originals), TX=%s; mark DSCP=EF, TTL=63, payload+=\"RINJ\"\n",
+
+    printf("[reinjector] RX=%s (ifb mirror of originals), TX=%s; appending UOPT(SHA256 of IP+UDP hdr), DSCP=EF, TTL=63\n",
            RX_IFACE, TX_IFACE);
 
     uint8_t inbuf[65536];
@@ -239,71 +302,27 @@ int main(void)
         if (!parse_ipv4_udp(inbuf, n, &P))
             continue;
 
-        // ---- LOOP AVOIDANCE ----
-        // Only act on DSCP==0 (originals) and skip frames that look like our reinjected copies
+        // Loop avoidance: only originals (DSCP==0); skip already-marked TTL=63
         if ((P.tos & 0xFC) != 0)
-            continue; // DSCP not zero => likely reinjected/other, skip
+            continue;
         if (P.ttl == 63)
-            continue; // our chosen reinject TTL, skip
-        if (payload_has_marker(&P, inbuf))
-            continue; // already has marker, skip
-        // ------------------------
-
-        // Build output frame = original + MARK_LEN (ensure MTU safety)
-        size_t out_len = P.frame_len + MARK_LEN;
-        if (out_len > sizeof(outbuf))
             continue;
 
-        memcpy(outbuf, inbuf, P.frame_len);
-        memcpy(outbuf + P.frame_len, MARK_BYTES, MARK_LEN);
+        size_t out_len = process_packet(&P, inbuf, (size_t)n, outbuf, sizeof(outbuf));
+        if (!out_len)
+            continue;
 
-        uint8_t *eth = outbuf + P.l2_off;
-        uint8_t *ip = outbuf + P.l3_off;
-        uint8_t *udp = outbuf + P.l4_off;
-
-        // Update IP total length and UDP length (+MARK_LEN)
-        uint16_t new_ip_tot = P.ip_tot_len + MARK_LEN;
-        uint16_t new_udp_len = P.udp_len + MARK_LEN;
-        ip[2] = (new_ip_tot >> 8) & 0xFF;
-        ip[3] = new_ip_tot & 0xFF;
-        udp[4] = (new_udp_len >> 8) & 0xFF;
-        udp[5] = new_udp_len & 0xFF;
-
-        // Mark DSCP=EF (0xb8) while preserving ECN (lowest 2 bits)
-        ip[1] = (ip[1] & 0x03) | 0xB8;
-        // Set TTL=63
-        ip[8] = 63;
-
-        // Recompute checksums
-        ip[10] = ip[11] = 0;
-        uint16_t ip_chk = ip_checksum(ip, P.ihl);
-        ip[10] = (ip_chk >> 8) & 0xFF;
-        ip[11] = ip_chk & 0xFF;
-
-        udp[6] = udp[7] = 0;
-        uint16_t udp_chk = udp_checksum(ip, udp, new_udp_len);
-        udp[6] = (udp_chk >> 8) & 0xFF;
-        udp[7] = udp_chk & 0xFF;
-
-        // Send out using original dest MAC on TX_IFACE
-        struct sockaddr_ll sll = {
-            .sll_family = AF_PACKET,
-            .sll_protocol = htons(ETH_P_IP),
-            .sll_ifindex = tx_ifindex,
-            .sll_halen = ETH_ALEN,
-        };
-        memcpy(sll.sll_addr, eth, 6); // dest MAC from original frame
-
-        ssize_t sent = sendto(tx, outbuf, out_len, 0, (struct sockaddr *)&sll, sizeof(sll));
+        // Send (TX socket already bound to TX_IFACE)
+        ssize_t sent = send(tx, outbuf, out_len, 0);
         if (sent < 0)
         {
-            perror("sendto");
+            perror("send");
             continue;
         }
 
         char src_ip_s[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, P.ip + 12, src_ip_s, sizeof(src_ip_s));
-        printf("reinj: %s -> %s:%u, out_len=%zd, DSCP=EF, TTL=63\n",
+        printf("reinj: %s -> %s:%u, +UOPT(sha256), out_len=%zd\n",
                src_ip_s, DST_IP_S, DST_PORT, sent);
         fflush(stdout);
     }
