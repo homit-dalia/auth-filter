@@ -2,23 +2,69 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
-#include <linux/if_packet.h>
 #include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <openssl/sha.h> // <-- OpenSSL SHA-256
+#include <openssl/sha.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <stdint.h>
 
-static const char *RX_IFACE = "ifb0"; // receive mirrored originals here
-static const char *TX_IFACE = "eno1"; // transmit reinjected copies here
+// ------------ config ------------
+static const char *RX_IFACE = "ifb0"; // where mirrored copies land
+static const char *TX_IFACE = "eno1"; // where we transmit reinjected frames
 static const char *DST_IP_S = "192.168.200.1";
 static const uint16_t DST_PORT = 9999;
+// Strip the UOPT on the destination before forwarding? (1=yes, 0=keep)
+#define STRIP_UOPT_ON_DEST 1
+// --------------------------------
+
+// --- runtime mode ---
+enum run_mode
+{
+    MODE_SOURCE = 0,
+    MODE_DEST = 1
+};
+
+// Canonicalize UDP header for hashing: zero length and checksum (bytes 4..7)
+static inline void make_udp_canonical8(const uint8_t *udp, uint8_t out[8])
+{
+    memcpy(out, udp, 8);
+    out[4] = 0; // len hi
+    out[5] = 0; // len lo
+    out[6] = 0; // csum hi
+    out[7] = 0; // csum lo
+}
+
+// prompt/parse mode (flag --mode source|dest or interactive)
+static enum run_mode pick_mode(int argc, char **argv)
+{
+    for (int i = 1; i < argc; ++i)
+    {
+        if (!strcmp(argv[i], "--mode") && i + 1 < argc)
+        {
+            if (!strcmp(argv[i + 1], "source"))
+                return MODE_SOURCE;
+            if (!strcmp(argv[i + 1], "dest"))
+                return MODE_DEST;
+        }
+    }
+    char buf[32] = {0};
+    fprintf(stdout, "Run as [source/dest]? ");
+    fflush(stdout);
+    if (fgets(buf, sizeof(buf), stdin))
+    {
+        if (strncasecmp(buf, "dest", 4) == 0)
+            return MODE_DEST;
+    }
+    return MODE_SOURCE;
+}
 
 // -------- checksum helpers --------
 static uint16_t ip_checksum(const void *vdata, size_t length)
@@ -47,21 +93,19 @@ static uint16_t ip_checksum(const void *vdata, size_t length)
 static uint16_t udp_checksum(const uint8_t *iphdr, const uint8_t *udphdr, size_t udp_len)
 {
     uint32_t acc = 0;
-    // pseudo header: src/dst
     for (int i = 12; i < 20; i += 2)
-    {
+    { // src/dst ip
         acc += (iphdr[i] << 8) | iphdr[i + 1];
         if (acc > 0xffff)
             acc -= 0xffff;
     }
-    // proto + length
-    acc += 17;
+    acc += 17; // proto
     if (acc > 0xffff)
         acc -= 0xffff;
     acc += udp_len;
     acc = (acc & 0xffff) + (acc >> 16);
     acc = (acc & 0xffff) + (acc >> 16);
-    // udp header + payload
+
     for (size_t i = 0; i + 1 < udp_len; i += 2)
     {
         uint16_t word = (udphdr[i] << 8) | udphdr[i + 1];
@@ -70,7 +114,7 @@ static uint16_t udp_checksum(const uint8_t *iphdr, const uint8_t *udphdr, size_t
             acc -= 0xffff;
     }
     if (udp_len & 1)
-    { // pad last byte
+    {
         uint16_t word = (udphdr[udp_len - 1] << 8);
         acc += word;
         if (acc > 0xffff)
@@ -79,6 +123,21 @@ static uint16_t udp_checksum(const uint8_t *iphdr, const uint8_t *udphdr, size_t
     return htons(~acc & 0xffff);
 }
 
+// Canonicalize IP header bytes for hashing: zero fields that change in transit
+// Zeros: TOS/DSCP+ECN (byte 1), Total Length (bytes 2-3), TTL (byte 8), Header Checksum (10-11)
+static size_t make_ip_canonical(const uint8_t *ip, size_t ihl, uint8_t *out60)
+{
+    if (ihl > 60)
+        return 0;
+    memcpy(out60, ip, ihl);
+    out60[1] = 0;  // TOS/DSCP+ECN
+    out60[2] = 0;  // Total Length (hi)
+    out60[3] = 0;  // Total Length (lo)
+    out60[8] = 0;  // TTL
+    out60[10] = 0; // Header checksum
+    out60[11] = 0;
+    return ihl;
+}
 // -------- parser for IPv4/UDP within Ethernet(+optional VLAN) --------
 struct parsed
 {
@@ -90,7 +149,7 @@ struct parsed
     uint16_t udp_len;
     uint16_t sport, dport;
     uint8_t tos, ttl;
-    uint8_t *eth; // begin frame
+    uint8_t *eth;
     uint8_t *ip;
     uint8_t *udp;
     uint8_t *payload;
@@ -103,8 +162,10 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
         return 0;
     uint16_t et = (f[12] << 8) | f[13];
     size_t l2 = 14;
+
+    // VLAN/QinQ (single tag handled)
     if (et == 0x8100 || et == 0x88A8)
-    { // VLAN/QinQ (single tag handled)
+    {
         if (n < 18)
             return 0;
         et = (f[16] << 8) | f[17];
@@ -112,6 +173,7 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     }
     if (et != 0x0800)
         return 0; // IPv4
+
     if (n < (ssize_t)(l2 + 20))
         return 0;
     uint8_t ihl = (f[l2] & 0x0F) * 4;
@@ -145,23 +207,45 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     out->payload = f + out->pay_off;
     out->tos = f[l2 + 1];
     out->ttl = f[l2 + 8];
-    memcpy(out->dst_mac, f, 6); // first 6 bytes of frame (destination MAC)
+    memcpy(out->dst_mac, f, 6);
     return 1;
 }
 
 // -------- our custom "UDP option" TLV (appended to payload) --------
-// Layout: "UOPT" (4 bytes) | kind=1 (1B) | len=32 (1B) | digest[32]
+// Layout: "UOPT"(4) | kind=1 (1B) | len=32 (1B) | digest[32]
 #pragma pack(push, 1)
 struct udp_opt_sha256
 {
-    char magic[4];      // 'U','O','P','T'
-    uint8_t kind;       // 1 = SHA256
-    uint8_t len;        // length of 'digest' (32)
-    uint8_t digest[32]; // SHA-256(IP hdr w/zeroed csum + UDP hdr)
+    char magic[4];
+    uint8_t kind;
+    uint8_t len;
+    uint8_t digest[32];
 };
 #pragma pack(pop)
 #define UOPT_KIND_SHA256 1
 #define UOPT_HDR_LEN (sizeof(struct udp_opt_sha256))
+
+// Try to read our TLV from the end of the UDP payload.
+// Returns 1 on success (fills *opt_out), 0 if missing/malformed.
+static int extract_uopt_tail(const struct parsed *P, const uint8_t *frame,
+                             struct udp_opt_sha256 *opt_out)
+{
+    int pay_len = (int)P->udp_len - 8;
+    if (pay_len < (int)UOPT_HDR_LEN)
+        return 0;
+    const uint8_t *tail = frame + P->pay_off + pay_len - UOPT_HDR_LEN;
+    struct udp_opt_sha256 tmp;
+    memcpy(&tmp, tail, UOPT_HDR_LEN);
+    if (memcmp(tmp.magic, "UOPT", 4) != 0)
+        return 0;
+    if (tmp.kind != UOPT_KIND_SHA256)
+        return 0;
+    if (tmp.len != 32)
+        return 0;
+    if (opt_out)
+        *opt_out = tmp;
+    return 1;
+}
 
 // ---- per-flow key lookup (returns a static 64B key for now) ----
 static const unsigned char *
@@ -173,22 +257,22 @@ key_lookup(const struct in_addr *saddr,
     (void)saddr;
     (void)daddr;
     (void)sport;
-    (void)dport; // unused for now
-
+    (void)dport;
     static const unsigned char KEY[] =
         "thisisaverysecure64bytehmacauthenticationkey12345678901234567890";
-    // KEY is 64 bytes (no trailing NUL is used in the hash)
     if (key_len_out)
-        *key_len_out = sizeof(KEY) - 0; // treat full 64 bytes as key
+        *key_len_out = sizeof(KEY); // use full 64 bytes
     return KEY;
 }
 
-// ---- core transformation: zero IP csum, hash headers, append TLV, fix lengths & checksums
-// Returns new frame length on success, 0 to skip.
-static size_t process_packet(const struct parsed *P, const uint8_t *in, size_t in_len,
-                             uint8_t *out, size_t out_cap)
+// core: in SOURCE mode, append TLV & mark; in DEST mode, verify (and optionally strip TLV)
+// Returns new frame length, sets *verified_ok in DEST (1 ok / 0 fail).
+static size_t process_packet(enum run_mode mode,
+                             const struct parsed *P,
+                             const uint8_t *in, size_t in_len,
+                             uint8_t *out, size_t out_cap,
+                             int *verified_ok)
 {
-    // Copy original frame
     if (in_len > out_cap)
         return 0;
     memcpy(out, in, in_len);
@@ -197,70 +281,137 @@ static size_t process_packet(const struct parsed *P, const uint8_t *in, size_t i
     uint8_t *ip = out + P->l3_off;
     uint8_t *udp = out + P->l4_off;
 
-    // 1) Reset IP header checksum (for hashing and later recompute)
-    uint8_t iptmp[60]; // max IPv4 header
-    if (P->ihl > sizeof(iptmp))
+    // Canonicalize IP header for hashing
+    uint8_t ipcanon[60];
+    size_t canon_len = make_ip_canonical(ip, P->ihl, ipcanon);
+    if (!canon_len)
         return 0;
-    memcpy(iptmp, ip, P->ihl);
-    iptmp[10] = iptmp[11] = 0;
 
-    // --- NEW: look up the per-flow key and hash key||headers ---
+    // Resolve key
     struct in_addr src_ip, dst_ip;
     memcpy(&src_ip, ip + 12, 4);
     memcpy(&dst_ip, ip + 16, 4);
-
     size_t key_len = 0;
     const unsigned char *key = key_lookup(&src_ip, &dst_ip, P->sport, P->dport, &key_len);
 
-    // 2) SHA-256 over: key || (IP header, zeroed csum) || (UDP header 8B)
+    // Build digest = SHA256( key || canon(IP) || UDP header 8B )
     uint8_t digest[32];
     SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    if (key && key_len)
-        SHA256_Update(&ctx, key, key_len);
-    SHA256_Update(&ctx, iptmp, P->ihl);
-    SHA256_Update(&ctx, udp, 8);
-    SHA256_Final(digest, &ctx);
 
-    // 3) Append our UDP option TLV to payload
-    if (out_len + UOPT_HDR_LEN > out_cap)
-        return 0;
-    struct udp_opt_sha256 opt;
-    memcpy(opt.magic, "UOPT", 4);
-    opt.kind = UOPT_KIND_SHA256;
-    opt.len = 32;
-    memcpy(opt.digest, digest, 32);
-    memcpy(out + out_len, &opt, UOPT_HDR_LEN);
-    out_len += UOPT_HDR_LEN;
+    if (mode == MODE_SOURCE)
+    {
+        SHA256_Init(&ctx);
+        if (key && key_len)
+            SHA256_Update(&ctx, key, key_len);
+        SHA256_Update(&ctx, ipcanon, canon_len);
+        uint8_t udpcanon[8];
+        make_udp_canonical8(udp, udpcanon);
+        SHA256_Update(&ctx, udpcanon, 8);
+        SHA256_Final(digest, &ctx);
 
-    // Update IP total length & UDP length
-    uint16_t new_ip_tot = (uint16_t)(P->ip_tot_len + UOPT_HDR_LEN);
-    uint16_t new_udp_len = (uint16_t)(P->udp_len + UOPT_HDR_LEN);
-    ip[2] = (new_ip_tot >> 8) & 0xFF;
-    ip[3] = new_ip_tot & 0xFF;
-    udp[4] = (new_udp_len >> 8) & 0xFF;
-    udp[5] = new_udp_len & 0xFF;
+        // Append TLV
+        if (out_len + UOPT_HDR_LEN > out_cap)
+            return 0;
+        struct udp_opt_sha256 opt;
+        memcpy(opt.magic, "UOPT", 4);
+        opt.kind = UOPT_KIND_SHA256;
+        opt.len = 32;
+        memcpy(opt.digest, digest, 32);
+        memcpy(out + out_len, &opt, UOPT_HDR_LEN);
+        out_len += UOPT_HDR_LEN;
 
-    // 4) Mark DSCP=EF (preserve ECN) and set TTL=63 for reinjected copies
-    ip[1] = (ip[1] & 0x03) | 0xB8;
-    ip[8] = 63;
+        // Bump lengths
+        uint16_t new_ip_tot = (uint16_t)(P->ip_tot_len + UOPT_HDR_LEN);
+        uint16_t new_udp_len = (uint16_t)(P->udp_len + UOPT_HDR_LEN);
+        ip[2] = (new_ip_tot >> 8) & 0xFF;
+        ip[3] = new_ip_tot & 0xFF;
+        udp[4] = (new_udp_len >> 8) & 0xFF;
+        udp[5] = new_udp_len & 0xFF;
 
-    // Recompute checksums
-    ip[10] = ip[11] = 0;
-    uint16_t ip_chk = ip_checksum(ip, P->ihl);
-    ip[10] = (ip_chk >> 8) & 0xFF;
-    ip[11] = ip_chk & 0xFF;
+        // Mark + recompute checksums
+        ip[1] = (ip[1] & 0x03) | 0xB8; // DSCP=EF
+        ip[8] = 63;                    // TTL=63
+        ip[10] = ip[11] = 0;
+        uint16_t ip_chk = ip_checksum(ip, P->ihl);
+        ip[10] = (ip_chk >> 8) & 0xFF;
+        ip[11] = ip_chk & 0xFF;
 
-    udp[6] = udp[7] = 0;
-    uint16_t udp_chk = udp_checksum(ip, udp, new_udp_len);
-    udp[6] = (udp_chk >> 8) & 0xFF;
-    udp[7] = udp_chk & 0xFF;
+        udp[6] = udp[7] = 0;
+        uint16_t udp_chk = udp_checksum(ip, udp, new_udp_len);
+        udp[6] = (udp_chk >> 8) & 0xFF;
+        udp[7] = udp_chk & 0xFF;
 
-    return out_len;
+        if (verified_ok)
+            *verified_ok = 1;
+        return out_len;
+    }
+    else
+    {
+        // DEST: verify existing TLV
+        struct udp_opt_sha256 got;
+        if (!extract_uopt_tail(P, in, &got))
+        {
+            if (verified_ok)
+                *verified_ok = 0;
+            fprintf(stderr, "reject: missing UOPT TLV\n");
+            return 0;
+        }
+
+        SHA256_Init(&ctx);
+        if (key && key_len)
+            SHA256_Update(&ctx, key, key_len);
+        SHA256_Update(&ctx, ipcanon, canon_len);
+        uint8_t udpcanon[8];
+        make_udp_canonical8(udp, udpcanon);
+        SHA256_Update(&ctx, udpcanon, 8);
+        SHA256_Final(digest, &ctx);
+
+        int ok = (memcmp(got.digest, digest, 32) == 0);
+        if (!ok)
+        {
+            if (verified_ok)
+                *verified_ok = 0;
+            fprintf(stderr, "reject: hash mismatch\n");
+            return 0;
+        }
+        if (verified_ok)
+            *verified_ok = ok;
+        if (!ok)
+            return 0;
+
+        if (STRIP_UOPT_ON_DEST)
+        {
+            if (out_len < UOPT_HDR_LEN)
+                return 0;
+            out_len -= UOPT_HDR_LEN;
+
+            // Shrink lengths
+            uint16_t new_ip_tot = (uint16_t)(P->ip_tot_len - UOPT_HDR_LEN);
+            uint16_t new_udp_len = (uint16_t)(P->udp_len - UOPT_HDR_LEN);
+            ip[2] = (new_ip_tot >> 8) & 0xFF;
+            ip[3] = new_ip_tot & 0xFF;
+            udp[4] = (new_udp_len >> 8) & 0xFF;
+            udp[5] = new_udp_len & 0xFF;
+
+            // Recompute checksums (keep DSCP/TTL as seen)
+            ip[10] = ip[11] = 0;
+            uint16_t ip_chk = ip_checksum(ip, P->ihl);
+            ip[10] = (ip_chk >> 8) & 0xFF;
+            ip[11] = ip_chk & 0xFF;
+
+            udp[6] = udp[7] = 0;
+            uint16_t udp_chk = udp_checksum(ip, udp, new_udp_len);
+            udp[6] = (udp_chk >> 8) & 0xFF;
+            udp[7] = udp_chk & 0xFF;
+        }
+        return out_len;
+    }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    enum run_mode MODE = pick_mode(argc, argv);
+
     int rx_ifindex = if_nametoindex(RX_IFACE);
     if (!rx_ifindex)
     {
@@ -307,12 +458,11 @@ int main(void)
         perror("bind tx");
         return 1;
     }
-
-    int snd = 4 * 1024 * 1024; // 4 MB buffer for TX
+    int snd = 4 * 1024 * 1024; // TX buffer
     setsockopt(tx, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
 
-    printf("[reinjector] RX=%s (ifb mirror of originals), TX=%s; appending UOPT(SHA256 of IP+UDP hdr), DSCP=EF, TTL=63\n",
-           RX_IFACE, TX_IFACE);
+    printf("[reinjector] mode=%s RX=%s, TX=%s; UOPT=SHA256(key||canonIP||UDPhdr)\n",
+           (MODE == MODE_SOURCE ? "source" : "dest"), RX_IFACE, TX_IFACE);
 
     uint8_t inbuf[65536];
     uint8_t outbuf[65536];
@@ -332,28 +482,73 @@ int main(void)
         if (!parse_ipv4_udp(inbuf, n, &P))
             continue;
 
-        // Loop avoidance: only originals (DSCP==0); skip already-marked TTL=63
-        if ((P.tos & 0xFC) != 0)
-            continue;
-        if (P.ttl == 63)
-            continue;
+        // Loop avoidance:
+        // SOURCE: only originals (DSCP==0), not TTL=63, no pre-existing TLV
+        // DEST:   we verify TLV; DSCP/TTL don't matter for verification
+        if (MODE == MODE_SOURCE)
+        {
+            if ((P.tos & 0xFC) != 0)
+                continue; // non-zero DSCP => skip
+            if (P.ttl == 63)
+                continue; // our own copies => skip
+            struct udp_opt_sha256 tmp;
+            if (extract_uopt_tail(&P, inbuf, &tmp))
+                continue; // already has UOPT
+        }
 
-        size_t out_len = process_packet(&P, inbuf, (size_t)n, outbuf, sizeof(outbuf));
-        if (!out_len)
-            continue;
+        int verified_ok = 0;
+        size_t out_len = process_packet(MODE, &P, inbuf, (size_t)n, outbuf, sizeof(outbuf), &verified_ok);
 
-        // Send (TX socket already bound to TX_IFACE)
-        ssize_t sent = send(tx, outbuf, out_len, 0);
+        if (MODE == MODE_DEST)
+        {
+            if (!out_len || !verified_ok)
+            {
+                char s[INET_ADDRSTRLEN], d[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, P.ip + 12, s, sizeof(s));
+                inet_ntop(AF_INET, P.ip + 16, d, sizeof(d));
+                fprintf(stderr, "reject: %s:%u -> %s:%u (hash mismatch or missing UOPT)\n",
+                        s, P.sport, d, P.dport);
+                fflush(stderr);
+                continue;
+            }
+        }
+        else
+        {
+            if (!out_len)
+                continue;
+        }
+
+        // Send out via TX_IFACE (use dest MAC from original frame)
+        struct sockaddr_ll sll = {
+            .sll_family = AF_PACKET,
+            .sll_protocol = htons(ETH_P_IP),
+            .sll_ifindex = tx_ifindex,
+            .sll_halen = ETH_ALEN,
+        };
+        memcpy(sll.sll_addr, inbuf, 6);
+
+        ssize_t sent = sendto(tx, outbuf, out_len, 0, (struct sockaddr *)&sll, sizeof(sll));
         if (sent < 0)
         {
-            perror("send");
+            perror("sendto");
             continue;
         }
 
-        char src_ip_s[INET_ADDRSTRLEN];
+        char src_ip_s[INET_ADDRSTRLEN], dst_ip_s[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, P.ip + 12, src_ip_s, sizeof(src_ip_s));
-        printf("reinj: %s -> %s:%u, +UOPT(sha256), out_len=%zd\n",
-               src_ip_s, DST_IP_S, DST_PORT, sent);
+        inet_ntop(AF_INET, P.ip + 16, dst_ip_s, sizeof(dst_ip_s));
+
+        if (MODE == MODE_SOURCE)
+        {
+            printf("src reinj: %s -> %s:%u, +UOPT(sha256), out_len=%zd\n",
+                   src_ip_s, dst_ip_s, P.dport, sent);
+        }
+        else
+        {
+            printf("dst accept: %s -> %s:%u, %sUOPT, out_len=%zd\n",
+                   src_ip_s, dst_ip_s, P.dport,
+                   STRIP_UOPT_ON_DEST ? "stripped " : "kept ", sent);
+        }
         fflush(stdout);
     }
 
