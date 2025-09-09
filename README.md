@@ -40,3 +40,57 @@ filter protocol ip pref 100 flower chain 0 handle 0x2
         backlog 0b 0p requeues 0
 
 hd431@bodhi:~/auth-filter$ 
+
+
+
+
+
+
+
+
+
+
+
+
+# banyan
+
+# mirror+drop originals on ingress so only verified copies get delivered
+sudo modprobe ifb
+ip link show ifb0 >/dev/null 2>&1 || sudo ip link add ifb0 type ifb
+sudo ip link set ifb0 up
+sudo tc qdisc add dev eno1 clsact 2>/dev/null || true
+sudo tc filter replace dev eno1 ingress pref 100 protocol ip \
+  flower ip_proto udp src_ip 192.168.200.2 dst_ip 192.168.200.1 dst_port 9999 \
+  action mirred egress mirror dev ifb0 \
+  action drop
+
+# create the TUN that will feed the host stack
+sudo ip tuntap add dev auth0 mode tun
+sudo ip link set auth0 up
+# helps when dst IP equals a local address on a different iface
+sudo sysctl -w net.ipv4.conf.auth0.accept_local=1
+
+# 1) Keep this (you set it earlier): allow “local” dst on this iface
+sudo sysctl -w net.ipv4.conf.auth0.accept_local=1
+
+# 2) Disable reverse path filtering so TUN-injected packets aren’t dropped
+sudo sysctl -w net.ipv4.conf.auth0.rp_filter=0
+sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+sudo sysctl -w net.ipv4.conf.default.rp_filter=0
+
+
+
+
+
+
+
+
+
+
+
+
+
+net.ipv4.conf.auth0.accept_local=1
+net.ipv4.conf.auth0.rp_filter=0
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
