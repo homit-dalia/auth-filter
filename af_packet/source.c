@@ -19,6 +19,11 @@
 #include <unistd.h>
 #include <stdint.h>
 
+#ifndef LOCAL_IP
+// Override per-host at build time, e.g. -DLOCAL_IP="\"192.168.200.1\""
+#define LOCAL_IP "0.0.0.0" // 0.0.0.0 ⇒ don't filter by local IP
+#endif
+
 // ------------ config ------------
 static const char *RX_IFACE = "ifb0";   // where mirrored copies land
 static const char *TX_IFACE = "eno1";   // where we transmit reinjected frames (source mode)
@@ -165,6 +170,7 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
 {
     if (n < 14)
         return 0;
+
     uint16_t et = (f[12] << 8) | f[13];
     size_t l2 = 14;
 
@@ -187,14 +193,13 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     if (f[l2 + 9] != 17)
         return 0; // UDP
 
+    // NEW: accept either direction if either port is 9999
+    uint16_t sport = (f[l2 + ihl] << 8) | f[l2 + ihl + 1];
     uint16_t dport = (f[l2 + ihl + 2] << 8) | f[l2 + ihl + 3];
-    struct in_addr dst_ip;
-    memcpy(&dst_ip, f + l2 + 16, 4);
-    char dst_ip_s[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &dst_ip, dst_ip_s, sizeof(dst_ip_s));
-    if (strcmp(dst_ip_s, DST_IP_S) != 0 || dport != DST_PORT)
+    if (sport != DST_PORT && dport != DST_PORT)
         return 0;
 
+    // Fill the parsed struct
     out->l2_off = 0;
     out->l3_off = l2;
     out->l4_off = l2 + ihl;
@@ -204,7 +209,7 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     out->ihl = ihl;
     out->ip_tot_len = (f[l2 + 2] << 8) | f[l2 + 3];
     out->udp_len = (f[out->l4_off + 4] << 8) | f[out->l4_off + 5];
-    out->sport = (f[out->l4_off] << 8) | f[out->l4_off + 1];
+    out->sport = sport;
     out->dport = dport;
     out->eth = f;
     out->ip = f + l2;
@@ -356,7 +361,7 @@ static size_t process_packet(enum run_mode mode,
         {
             if (verified_ok)
                 *verified_ok = 0;
-            fprintf(stderr, "reject: missing UOPT TLV\n");
+            // fprintf(stderr, "reject: missing UOPT TLV\n");
             return 0;
         }
 
@@ -500,12 +505,16 @@ int main(int argc, char **argv)
         }
     }
 
-    printf("[reinjector] mode=%s RX=%s, TX=%s%s; UOPT=SHA256(key||canonIP||UDPhdr)\n",
-           (MODE == MODE_SOURCE ? "source" : "dest"),
-           RX_IFACE,
-           (MODE == MODE_SOURCE ? TX_IFACE : "(none)"),
-           (MODE == MODE_DEST ? ", TUN=" : ""),
-           (MODE == MODE_DEST ? TUN_IFACE : ""));
+    // Parse LOCAL_IP once; used to ignore mirrored traffic not destined to us.
+    struct in_addr me = (struct in_addr){0};
+    inet_pton(AF_INET, LOCAL_IP, &me);
+
+    // printf("[reinjector] mode=%s RX=%s, TX=%s%s; UOPT=SHA256(key||canonIP||UDPhdr)\n",
+        //    (MODE == MODE_SOURCE ? "source" : "dest"),
+        //    RX_IFACE,
+        //    (MODE == MODE_SOURCE ? TX_IFACE : "(none)"),
+        //    (MODE == MODE_DEST ? ", TUN=" : ""),
+        //    (MODE == MODE_DEST ? TUN_IFACE : ""));
 
     uint8_t inbuf[65536];
     uint8_t outbuf[65536];
@@ -524,6 +533,18 @@ int main(int argc, char **argv)
         struct parsed P;
         if (!parse_ipv4_udp(inbuf, n, &P))
             continue;
+
+        if (MODE == MODE_DEST)
+        {
+            struct in_addr daddr;
+            memcpy(&daddr, P.ip + 16, 4); // IPv4 dst
+
+            if (me.s_addr && daddr.s_addr != me.s_addr)
+                continue; // not for this host ⇒ ignore silently
+
+            if (P.sport != DST_PORT && P.dport != DST_PORT)
+                continue; // neither side is 9999 ⇒ ignore
+        }
 
         // Loop avoidance:
         if (MODE == MODE_SOURCE)
@@ -547,8 +568,8 @@ int main(int argc, char **argv)
                 char s[INET_ADDRSTRLEN], d[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, P.ip + 12, s, sizeof(s));
                 inet_ntop(AF_INET, P.ip + 16, d, sizeof(d));
-                fprintf(stderr, "reject: %s:%u -> %s:%u (hash mismatch or missing UOPT)\n",
-                        s, P.sport, d, P.dport);
+                // fprintf(stderr, "reject: %s:%u -> %s:%u (hash mismatch or missing UOPT)\n",
+                        // s, P.sport, d, P.dport);
                 fflush(stderr);
                 continue;
             }
@@ -580,8 +601,8 @@ int main(int argc, char **argv)
             char src_ip_s[INET_ADDRSTRLEN], dst_ip_s[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, P.ip + 12, src_ip_s, sizeof(src_ip_s));
             inet_ntop(AF_INET, P.ip + 16, dst_ip_s, sizeof(dst_ip_s));
-            printf("src reinj: %s -> %s:%u, +UOPT(sha256), out_len=%zd\n",
-                   src_ip_s, dst_ip_s, P.dport, sent);
+            // printf("src reinj: %s -> %s:%u, +UOPT(sha256), out_len=%zd\n",
+                //    src_ip_s, dst_ip_s, P.dport, sent);
             fflush(stdout);
         }
         else
@@ -599,9 +620,9 @@ int main(int argc, char **argv)
             char src_ip_s[INET_ADDRSTRLEN], dst_ip_s[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, ip + 12, src_ip_s, sizeof(src_ip_s));
             inet_ntop(AF_INET, ip + 16, dst_ip_s, sizeof(dst_ip_s));
-            printf("dst accept→INPUT: %s -> %s:%u, %sUOPT, ip_len=%u\n",
-                   src_ip_s, dst_ip_s, P.dport,
-                   STRIP_UOPT_ON_DEST ? "stripped " : "kept ", ip_tot);
+            // printf("dst accept→INPUT: %s -> %s:%u, %sUOPT, ip_len=%u\n",
+                //    src_ip_s, dst_ip_s, P.dport,
+                //    STRIP_UOPT_ON_DEST ? "stripped " : "kept ", ip_tot);
             fflush(stdout);
         }
     }
