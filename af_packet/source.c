@@ -1,5 +1,13 @@
 // af_reinject.c
 #define _GNU_SOURCE
+
+#include "radix_trie_api.h" // <-- use include path, not ../
+#include <limits.h>         // for PATH_MAX
+
+#ifndef PREFIX_CSV
+#define PREFIX_CSV "../ip_lookup_cpu/src/data/prefix_table.csv"
+#endif
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,6 +32,8 @@
 #define LOCAL_IP "0.0.0.0" // 0.0.0.0 ⇒ don't filter by local IP
 #endif
 
+static BinaryTrie *g_trie = NULL;
+
 // ------------ config ------------
 static const char *RX_IFACE = "ifb0";   // where mirrored copies land
 static const char *TX_IFACE = "eno1";   // where we transmit reinjected frames (source mode)
@@ -33,6 +43,38 @@ static const uint16_t DST_PORT = 9999;
 // Strip the UOPT on the destination before forwarding? (1=yes, 0=keep)
 #define STRIP_UOPT_ON_DEST 1
 // --------------------------------
+
+static int file_readable(const char *p) { return p && access(p, R_OK) == 0; }
+
+// choose CSV path: env -> same dir as exe -> compiled fallback
+static const char *choose_csv_path(char *out, size_t out_sz)
+{
+    const char *env = getenv("PREFIX_CSV");
+    if (file_readable(env))
+        return env;
+
+    char exe[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0)
+    {
+        exe[n] = 0;
+        char *dup = strdup(exe);
+        if (dup)
+        {
+            char *dir = dirname(dup);
+            int ok = snprintf(out, out_sz, "%s/%s", dir, "prefix_table.csv");
+            if (ok > 0 && (size_t)ok < out_sz && file_readable(out))
+            {
+                free(dup);
+                return out;
+            }
+            free(dup);
+        }
+    }
+    if (file_readable(PREFIX_CSV))
+        return PREFIX_CSV;
+    return NULL;
+}
 
 // --- runtime mode ---
 enum run_mode
@@ -257,21 +299,64 @@ static int extract_uopt_tail(const struct parsed *P, const uint8_t *frame,
 }
 
 // ---- per-flow key lookup (returns a static 64B key for now) ----
+// Derive 64B per-flow key = Expand( SHA256(base_key || src_ip || sport || dport) )
 static const unsigned char *
 key_lookup(const struct in_addr *saddr,
-           const struct in_addr *daddr,
+           const struct in_addr *_daddr, // unused for derivation, but kept for signature symmetry
            uint16_t sport, uint16_t dport,
            size_t *key_len_out)
 {
-    (void)saddr;
-    (void)daddr;
-    (void)sport;
-    (void)dport;
-    static const unsigned char KEY[] =
-        "thisisaverysecure64bytehmacauthenticationkey12345678901234567890";
+    static unsigned char DERIVED[64]; // single-threaded program => ok
+
+    // 1) LPM on source IP (host order)
+    uint32_t src_hbo = ntohl(saddr->s_addr);
+    const unsigned char *base = NULL;
+    size_t base_len = 0;
+    if (!g_trie || !rt_lookup_key(g_trie, src_hbo, &base, &base_len) || base_len == 0)
+    {
+        // no match => signal missing key
+        if (key_len_out)
+            *key_len_out = 0;
+        return NULL;
+    }
+
+    // 2) Derive per-flow material using ports in network order (wire order)
+    //    info = src_ip_be(4) || sport_be(2) || dport_be(2)
+    unsigned char info[8];
+    memcpy(info, &saddr->s_addr, 4);
+    info[4] = (uint8_t)(sport >> 8);
+    info[5] = (uint8_t)(sport & 0xFF);
+    info[6] = (uint8_t)(dport >> 8);
+    info[7] = (uint8_t)(dport & 0xFF);
+
+    // F = SHA256(base || info || 0x01) || SHA256(base || info || 0x02)
+    unsigned char ibuf1[1] = {0x01}, ibuf2[1] = {0x02};
+    unsigned char h1[32], h2[32];
+    SHA256_CTX c;
+
+    SHA256_Init(&c);
+    SHA256_Update(&c, base, base_len);
+    SHA256_Update(&c, info, sizeof(info));
+    SHA256_Update(&c, ibuf1, 1);
+    SHA256_Final(h1, &c);
+
+    SHA256_Init(&c);
+    SHA256_Update(&c, base, base_len);
+    SHA256_Update(&c, info, sizeof(info));
+    SHA256_Update(&c, ibuf2, 1);
+    SHA256_Final(h2, &c);
+
+    memcpy(DERIVED, h1, 32);
+    memcpy(DERIVED + 32, h2, 32);
+
     if (key_len_out)
-        *key_len_out = sizeof(KEY); // use full 64 bytes
-    return KEY;
+        *key_len_out = sizeof(DERIVED);
+    // printf("Derived key for %s:%u->%u: ",
+        //    inet_ntoa(*saddr), sport, dport);
+    // for (size_t i = 0; i < sizeof(DERIVED); ++i)
+        // printf("%02x", DERIVED[i]);
+    // printf("\n");
+    return DERIVED;
 }
 
 // core: in SOURCE mode, append TLV & mark; in DEST mode, verify (and optionally strip TLV)
@@ -440,6 +525,21 @@ int main(int argc, char **argv)
 {
     enum run_mode MODE = pick_mode(argc, argv);
 
+    // --- CSV path (simple & safe) ---
+    const char *csv_path = getenv("PREFIX_CSV");
+    if (!csv_path || !*csv_path)
+    {
+        csv_path = PREFIX_CSV; // compile-time fallback (may be relative)
+    }
+
+    g_trie = rt_load_csv(csv_path);
+    if (!g_trie)
+    {
+        fprintf(stderr, "Failed to load prefix CSV: %s\n", csv_path);
+        return 1;
+    }
+    fprintf(stderr, "Loaded prefix CSV: %s\n", csv_path);
+
     int rx_ifindex = if_nametoindex(RX_IFACE);
     if (!rx_ifindex)
     {
@@ -510,11 +610,11 @@ int main(int argc, char **argv)
     inet_pton(AF_INET, LOCAL_IP, &me);
 
     // printf("[reinjector] mode=%s RX=%s, TX=%s%s; UOPT=SHA256(key||canonIP||UDPhdr)\n",
-        //    (MODE == MODE_SOURCE ? "source" : "dest"),
-        //    RX_IFACE,
-        //    (MODE == MODE_SOURCE ? TX_IFACE : "(none)"),
-        //    (MODE == MODE_DEST ? ", TUN=" : ""),
-        //    (MODE == MODE_DEST ? TUN_IFACE : ""));
+    //    (MODE == MODE_SOURCE ? "source" : "dest"),
+    //    RX_IFACE,
+    //    (MODE == MODE_SOURCE ? TX_IFACE : "(none)"),
+    //    (MODE == MODE_DEST ? ", TUN=" : ""),
+    //    (MODE == MODE_DEST ? TUN_IFACE : ""));
 
     uint8_t inbuf[65536];
     uint8_t outbuf[65536];
@@ -569,7 +669,7 @@ int main(int argc, char **argv)
                 inet_ntop(AF_INET, P.ip + 12, s, sizeof(s));
                 inet_ntop(AF_INET, P.ip + 16, d, sizeof(d));
                 // fprintf(stderr, "reject: %s:%u -> %s:%u (hash mismatch or missing UOPT)\n",
-                        // s, P.sport, d, P.dport);
+                // s, P.sport, d, P.dport);
                 fflush(stderr);
                 continue;
             }
@@ -602,7 +702,7 @@ int main(int argc, char **argv)
             inet_ntop(AF_INET, P.ip + 12, src_ip_s, sizeof(src_ip_s));
             inet_ntop(AF_INET, P.ip + 16, dst_ip_s, sizeof(dst_ip_s));
             // printf("src reinj: %s -> %s:%u, +UOPT(sha256), out_len=%zd\n",
-                //    src_ip_s, dst_ip_s, P.dport, sent);
+            //    src_ip_s, dst_ip_s, P.dport, sent);
             fflush(stdout);
         }
         else
@@ -621,8 +721,8 @@ int main(int argc, char **argv)
             inet_ntop(AF_INET, ip + 12, src_ip_s, sizeof(src_ip_s));
             inet_ntop(AF_INET, ip + 16, dst_ip_s, sizeof(dst_ip_s));
             // printf("dst accept→INPUT: %s -> %s:%u, %sUOPT, ip_len=%u\n",
-                //    src_ip_s, dst_ip_s, P.dport,
-                //    STRIP_UOPT_ON_DEST ? "stripped " : "kept ", ip_tot);
+            //    src_ip_s, dst_ip_s, P.dport,
+            //    STRIP_UOPT_ON_DEST ? "stripped " : "kept ", ip_tot);
             fflush(stdout);
         }
     }
@@ -632,5 +732,9 @@ int main(int argc, char **argv)
     if (tx >= 0)
         close(tx);
     close(rx);
+
+    if (g_trie)
+        rt_destroy(g_trie);
+
     return 0;
 }

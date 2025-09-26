@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "radix_trie_api.h": "c",
+        "if_packet.h": "c"
+    }
+}
