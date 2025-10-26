@@ -18,4 +18,4 @@ receiver:
 		-lcrypto
 	mv af_reinject /tmp/
 	cp $(CSV) /tmp/prefix_table.csv
-	sudo env PREFIX_CSV=/tmp/prefix_table.csv /tmp/af_reinject --mode dest
+	sudo env PREFIX_CSV=/tmp/prefix_table.csv /tmp/af_reinject --mode destip
