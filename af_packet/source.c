@@ -36,7 +36,7 @@ static BinaryTrie *g_trie = NULL;
 
 // ------------ config ------------
 static const char *RX_IFACE = "ifb0";   // where mirrored copies land
-static const char *TX_IFACE = "eno1";   // where we transmit reinjected frames (source mode)
+static const char *TX_IFACE = "100G_DATA1";   // where we transmit reinjected frames (source mode)
 static const char *TUN_IFACE = "auth0"; // where we inject to host stack (dest mode, L3 only)
 static const char *DST_IP_S = "192.168.200.1";
 static const uint16_t DST_PORT = 9999;
