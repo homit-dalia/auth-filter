@@ -1,9 +1,8 @@
 // af_reinject.c
 #define _GNU_SOURCE
 
-#include "radix_trie_api.h" // <-- use include path, not ../
-#include <limits.h>         // for PATH_MAX
-
+#include "radix_trie_api.h"
+#include <limits.h>
 #ifndef PREFIX_CSV
 #define PREFIX_CSV "../ip_lookup_cpu/src/data/prefix_table.csv"
 #endif
@@ -11,6 +10,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libgen.h> // dirname()
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/if_tun.h>
@@ -28,25 +28,23 @@
 #include <stdint.h>
 
 #ifndef LOCAL_IP
-// Override per-host at build time, e.g. -DLOCAL_IP="\"192.168.200.1\""
-#define LOCAL_IP "0.0.0.0" // 0.0.0.0 ⇒ don't filter by local IP
+// Compile-time override example: -DLOCAL_IP="\"192.168.201.2\""
+#define LOCAL_IP "0.0.0.0" // 0.0.0.0 ⇒ don't filter by local IP at DEST
 #endif
 
 static BinaryTrie *g_trie = NULL;
 
-// ------------ config ------------
-static const char *RX_IFACE = "ifb0";   // where mirrored copies land
-static const char *TX_IFACE = "100G_DATA1";   // where we transmit reinjected frames (source mode)
-static const char *TUN_IFACE = "auth0"; // where we inject to host stack (dest mode, L3 only)
+// ------------ config (with runtime override) ------------
+static char RX_IFACE[IFNAMSIZ] = "ifb0";   // where mirrored copies land
+static char TX_IFACE[IFNAMSIZ] = "";       // chosen at runtime: env → eno1 → 100G_DATA1 → DATA1
+static char TUN_IFACE[IFNAMSIZ] = "auth0"; // used in DEST mode (L3 inject)
 static const char *DST_IP_S = "192.168.200.1";
 static const uint16_t DST_PORT = 9999;
-// Strip the UOPT on the destination before forwarding? (1=yes, 0=keep)
 #define STRIP_UOPT_ON_DEST 1
-// --------------------------------
+// --------------------------------------------------------
 
 static int file_readable(const char *p) { return p && access(p, R_OK) == 0; }
 
-// choose CSV path: env -> same dir as exe -> compiled fallback
 static const char *choose_csv_path(char *out, size_t out_sz)
 {
     const char *env = getenv("PREFIX_CSV");
@@ -83,17 +81,6 @@ enum run_mode
     MODE_DEST = 1
 };
 
-// Canonicalize UDP header for hashing: zero length and checksum (bytes 4..7)
-static inline void make_udp_canonical8(const uint8_t *udp, uint8_t out[8])
-{
-    memcpy(out, udp, 8);
-    out[4] = 0;
-    out[5] = 0; // len
-    out[6] = 0;
-    out[7] = 0; // csum
-}
-
-// prompt/parse mode (flag --mode source|dest or interactive)
 static enum run_mode pick_mode(int argc, char **argv)
 {
     for (int i = 1; i < argc; ++i)
@@ -115,6 +102,63 @@ static enum run_mode pick_mode(int argc, char **argv)
             return MODE_DEST;
     }
     return MODE_SOURCE;
+}
+
+// -------- small helpers --------
+static int iface_exists(const char *name)
+{
+    return (name && *name && if_nametoindex(name) != 0);
+}
+static int iface_up(const char *name)
+{
+    if (!name || !*name)
+        return 0;
+    char p[256];
+    snprintf(p, sizeof(p), "/sys/class/net/%s/operstate", name);
+    FILE *f = fopen(p, "r");
+    if (!f)
+        return 0;
+    char s[32] = {0};
+    fgets(s, sizeof(s), f);
+    fclose(f);
+    return (strncmp(s, "up", 2) == 0) || (strncmp(s, "unknown", 7) == 0);
+}
+
+// Prefer env TX_IFACE; else try candidates in order.
+static void select_tx_iface(void)
+{
+    const char *env = getenv("TX_IFACE");
+    if (env && *env && iface_exists(env))
+    {
+        strncpy(TX_IFACE, env, sizeof(TX_IFACE) - 1);
+        return;
+    }
+    const char *cands[] = {"eno1", "100G_DATA1", "DATA1"};
+    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); ++i)
+    {
+        if (iface_exists(cands[i]))
+        {
+            strncpy(TX_IFACE, cands[i], sizeof(TX_IFACE) - 1);
+            // Prefer an interface that is UP; if it's not up, we still pick it but warn.
+            if (!iface_up(TX_IFACE))
+            {
+                fprintf(stderr, "[warn] TX_IFACE %s exists but not UP; continuing.\n", TX_IFACE);
+            }
+            return;
+        }
+    }
+    // Fallback: keep empty and let later checks fail with a clear error.
+    TX_IFACE[0] = '\0';
+}
+
+// Canonicalize UDP header for hashing: zero length and checksum (bytes 4..7)
+static inline void make_udp_canonical8(const uint8_t *udp, uint8_t out[8])
+{
+    memcpy(out, udp, 8);
+    out[4] = 0;
+    out[5] = 0; // len
+    out[6] = 0;
+    out[7] = 0; // csum
 }
 
 // -------- checksum helpers --------
@@ -145,29 +189,28 @@ static uint16_t udp_checksum(const uint8_t *iphdr, const uint8_t *udphdr, size_t
 {
     uint32_t acc = 0;
     for (int i = 12; i < 20; i += 2)
-    { // src/dst ip
+    {
         acc += (iphdr[i] << 8) | iphdr[i + 1];
         if (acc > 0xffff)
             acc -= 0xffff;
     }
     acc += 17;
     if (acc > 0xffff)
-        acc -= 0xffff; // proto
+        acc -= 0xffff;
     acc += udp_len;
     acc = (acc & 0xffff) + (acc >> 16);
     acc = (acc & 0xffff) + (acc >> 16);
-
     for (size_t i = 0; i + 1 < udp_len; i += 2)
     {
-        uint16_t word = (udphdr[i] << 8) | udphdr[i + 1];
-        acc += word;
+        uint16_t w = (udphdr[i] << 8) | udphdr[i + 1];
+        acc += w;
         if (acc > 0xffff)
             acc -= 0xffff;
     }
     if (udp_len & 1)
     {
-        uint16_t word = (udphdr[udp_len - 1] << 8);
-        acc += word;
+        uint16_t w = (udphdr[udp_len - 1] << 8);
+        acc += w;
         if (acc > 0xffff)
             acc -= 0xffff;
     }
@@ -175,18 +218,17 @@ static uint16_t udp_checksum(const uint8_t *iphdr, const uint8_t *udphdr, size_t
 }
 
 // Canonicalize IP header bytes for hashing: zero fields that change in transit
-// Zeros: TOS/DSCP+ECN (1), Total Length (2-3), TTL (8), Header Checksum (10-11)
 static size_t make_ip_canonical(const uint8_t *ip, size_t ihl, uint8_t *out60)
 {
     if (ihl > 60)
         return 0;
     memcpy(out60, ip, ihl);
-    out60[1] = 0; // TOS
+    out60[1] = 0;
     out60[2] = 0;
-    out60[3] = 0; // Total Length
-    out60[8] = 0; // TTL
+    out60[3] = 0; // TOS, Total Length
+    out60[8] = 0;
     out60[10] = 0;
-    out60[11] = 0; // checksum
+    out60[11] = 0; // TTL, checksum
     return ihl;
 }
 
@@ -212,11 +254,8 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
 {
     if (n < 14)
         return 0;
-
     uint16_t et = (f[12] << 8) | f[13];
     size_t l2 = 14;
-
-    // VLAN/QinQ (single tag handled)
     if (et == 0x8100 || et == 0x88A8)
     {
         if (n < 18)
@@ -226,7 +265,6 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
     }
     if (et != 0x0800)
         return 0; // IPv4
-
     if (n < (ssize_t)(l2 + 20))
         return 0;
     uint8_t ihl = (f[l2] & 0x0F) * 4;
@@ -234,14 +272,11 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
         return 0;
     if (f[l2 + 9] != 17)
         return 0; // UDP
-
-    // NEW: accept either direction if either port is 9999
     uint16_t sport = (f[l2 + ihl] << 8) | f[l2 + ihl + 1];
     uint16_t dport = (f[l2 + ihl + 2] << 8) | f[l2 + ihl + 3];
     if (sport != DST_PORT && dport != DST_PORT)
         return 0;
 
-    // Fill the parsed struct
     out->l2_off = 0;
     out->l3_off = l2;
     out->l4_off = l2 + ihl;
@@ -264,7 +299,6 @@ static int parse_ipv4_udp(uint8_t *f, ssize_t n, struct parsed *out)
 }
 
 // -------- our custom "UDP option" TLV (appended to payload) --------
-// Layout: "UOPT"(4) | kind=1 (1B) | len=32 (1B) | digest[32]
 #pragma pack(push, 1)
 struct udp_opt_sha256
 {
@@ -277,7 +311,6 @@ struct udp_opt_sha256
 #define UOPT_KIND_SHA256 1
 #define UOPT_HDR_LEN (sizeof(struct udp_opt_sha256))
 
-// Try to read our TLV from the end of the UDP payload.
 static int extract_uopt_tail(const struct parsed *P, const uint8_t *frame,
                              struct udp_opt_sha256 *opt_out)
 {
@@ -298,30 +331,23 @@ static int extract_uopt_tail(const struct parsed *P, const uint8_t *frame,
     return 1;
 }
 
-// ---- per-flow key lookup (returns a static 64B key for now) ----
-// Derive 64B per-flow key = Expand( SHA256(base_key || src_ip || sport || dport) )
+// ---- per-flow key lookup ----
 static const unsigned char *
 key_lookup(const struct in_addr *saddr,
-           const struct in_addr *_daddr, // unused for derivation, but kept for signature symmetry
+           const struct in_addr *_daddr,
            uint16_t sport, uint16_t dport,
            size_t *key_len_out)
 {
-    static unsigned char DERIVED[64]; // single-threaded program => ok
-
-    // 1) LPM on source IP (host order)
+    static unsigned char DERIVED[64];
     uint32_t src_hbo = ntohl(saddr->s_addr);
     const unsigned char *base = NULL;
     size_t base_len = 0;
     if (!g_trie || !rt_lookup_key(g_trie, src_hbo, &base, &base_len) || base_len == 0)
     {
-        // no match => signal missing key
         if (key_len_out)
             *key_len_out = 0;
         return NULL;
     }
-
-    // 2) Derive per-flow material using ports in network order (wire order)
-    //    info = src_ip_be(4) || sport_be(2) || dport_be(2)
     unsigned char info[8];
     memcpy(info, &saddr->s_addr, 4);
     info[4] = (uint8_t)(sport >> 8);
@@ -329,39 +355,30 @@ key_lookup(const struct in_addr *saddr,
     info[6] = (uint8_t)(dport >> 8);
     info[7] = (uint8_t)(dport & 0xFF);
 
-    // F = SHA256(base || info || 0x01) || SHA256(base || info || 0x02)
-    unsigned char ibuf1[1] = {0x01}, ibuf2[1] = {0x02};
+    unsigned char ib1[1] = {0x01}, ib2[1] = {0x02};
     unsigned char h1[32], h2[32];
     SHA256_CTX c;
 
     SHA256_Init(&c);
     SHA256_Update(&c, base, base_len);
     SHA256_Update(&c, info, sizeof(info));
-    SHA256_Update(&c, ibuf1, 1);
+    SHA256_Update(&c, ib1, 1);
     SHA256_Final(h1, &c);
-
     SHA256_Init(&c);
     SHA256_Update(&c, base, base_len);
     SHA256_Update(&c, info, sizeof(info));
-    SHA256_Update(&c, ibuf2, 1);
+    SHA256_Update(&c, ib2, 1);
     SHA256_Final(h2, &c);
 
     memcpy(DERIVED, h1, 32);
     memcpy(DERIVED + 32, h2, 32);
-
     if (key_len_out)
         *key_len_out = sizeof(DERIVED);
-    // printf("Derived key for %s:%u->%u: ",
-        //    inet_ntoa(*saddr), sport, dport);
-    // for (size_t i = 0; i < sizeof(DERIVED); ++i)
-        // printf("%02x", DERIVED[i]);
-    // printf("\n");
     return DERIVED;
 }
 
-// core: in SOURCE mode, append TLV & mark; in DEST mode, verify (and optionally strip TLV)
-static size_t process_packet(enum run_mode mode,
-                             const struct parsed *P,
+// core processing
+static size_t process_packet(enum run_mode mode, const struct parsed *P,
                              const uint8_t *in, size_t in_len,
                              uint8_t *out, size_t out_cap,
                              int *verified_ok)
@@ -374,20 +391,17 @@ static size_t process_packet(enum run_mode mode,
     uint8_t *ip = out + P->l3_off;
     uint8_t *udp = out + P->l4_off;
 
-    // Canonicalize IP header for hashing
     uint8_t ipcanon[60];
     size_t canon_len = make_ip_canonical(ip, P->ihl, ipcanon);
     if (!canon_len)
         return 0;
 
-    // Resolve key
     struct in_addr src_ip, dst_ip;
     memcpy(&src_ip, ip + 12, 4);
     memcpy(&dst_ip, ip + 16, 4);
     size_t key_len = 0;
     const unsigned char *key = key_lookup(&src_ip, &dst_ip, P->sport, P->dport, &key_len);
 
-    // Build digest = SHA256( key || canon(IP) || canonical UDP header 8B )
     uint8_t digest[32];
     SHA256_CTX ctx;
 
@@ -402,7 +416,6 @@ static size_t process_packet(enum run_mode mode,
         SHA256_Update(&ctx, udpcanon, 8);
         SHA256_Final(digest, &ctx);
 
-        // Append TLV
         if (out_len + UOPT_HDR_LEN > out_cap)
             return 0;
         struct udp_opt_sha256 opt;
@@ -413,7 +426,6 @@ static size_t process_packet(enum run_mode mode,
         memcpy(out + out_len, &opt, UOPT_HDR_LEN);
         out_len += UOPT_HDR_LEN;
 
-        // Bump lengths
         uint16_t new_ip_tot = (uint16_t)(P->ip_tot_len + UOPT_HDR_LEN);
         uint16_t new_udp_len = (uint16_t)(P->udp_len + UOPT_HDR_LEN);
         ip[2] = (new_ip_tot >> 8) & 0xFF;
@@ -421,9 +433,8 @@ static size_t process_packet(enum run_mode mode,
         udp[4] = (new_udp_len >> 8) & 0xFF;
         udp[5] = new_udp_len & 0xFF;
 
-        // Mark + recompute checksums
         ip[1] = (ip[1] & 0x03) | 0xB8; // DSCP=EF
-        ip[8] = 63;                    // TTL=63
+        ip[8] = 63;                    // TTL
         ip[10] = ip[11] = 0;
         uint16_t ip_chk = ip_checksum(ip, P->ihl);
         ip[10] = (ip_chk >> 8) & 0xFF;
@@ -440,13 +451,11 @@ static size_t process_packet(enum run_mode mode,
     }
     else
     {
-        // DEST: verify existing TLV
         struct udp_opt_sha256 got;
         if (!extract_uopt_tail(P, in, &got))
         {
             if (verified_ok)
                 *verified_ok = 0;
-            // fprintf(stderr, "reject: missing UOPT TLV\n");
             return 0;
         }
 
@@ -476,7 +485,6 @@ static size_t process_packet(enum run_mode mode,
                 return 0;
             out_len -= UOPT_HDR_LEN;
 
-            // Shrink lengths
             uint16_t new_ip_tot = (uint16_t)(P->ip_tot_len - UOPT_HDR_LEN);
             uint16_t new_udp_len = (uint16_t)(P->udp_len - UOPT_HDR_LEN);
             ip[2] = (new_ip_tot >> 8) & 0xFF;
@@ -484,7 +492,6 @@ static size_t process_packet(enum run_mode mode,
             udp[4] = (new_udp_len >> 8) & 0xFF;
             udp[5] = new_udp_len & 0xFF;
 
-            // Recompute checksums (keep DSCP/TTL as seen)
             ip[10] = ip[11] = 0;
             uint16_t ip_chk = ip_checksum(ip, P->ihl);
             ip[10] = (ip_chk >> 8) & 0xFF;
@@ -510,7 +517,7 @@ static int tun_open(const char *name)
         return -1;
     }
     memset(&ifr, 0, sizeof(ifr));
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI; // L3 IPv4/IPv6, no extra proto info
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
     strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
     if (ioctl(fd, TUNSETIFF, (void *)&ifr) < 0)
     {
@@ -523,13 +530,23 @@ static int tun_open(const char *name)
 
 int main(int argc, char **argv)
 {
+    // Allow env overrides for RX/TX/TUN
+    const char *rx_env = getenv("RX_IFACE");
+    if (rx_env && *rx_env)
+        strncpy(RX_IFACE, rx_env, sizeof(RX_IFACE) - 1);
+    const char *tun_env = getenv("TUN_IFACE");
+    if (tun_env && *tun_env)
+        strncpy(TUN_IFACE, tun_env, sizeof(TUN_IFACE) - 1);
+    select_tx_iface(); // sets TX_IFACE (env or fallback list)
+
     enum run_mode MODE = pick_mode(argc, argv);
 
-    // --- CSV path (simple & safe) ---
-    const char *csv_path = getenv("PREFIX_CSV");
-    if (!csv_path || !*csv_path)
+    char csv_buf[PATH_MAX] = {0};
+    const char *csv_path = choose_csv_path(csv_buf, sizeof(csv_buf));
+    if (!csv_path)
     {
-        csv_path = PREFIX_CSV; // compile-time fallback (may be relative)
+        fprintf(stderr, "No prefix CSV found.\n");
+        return 1;
     }
 
     g_trie = rt_load_csv(csv_path);
@@ -540,12 +557,19 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "Loaded prefix CSV: %s\n", csv_path);
 
+    if (!TX_IFACE[0])
+    {
+        fprintf(stderr, "No TX_IFACE available (tried env, eno1, 100G_DATA1, DATA1).\n");
+        return 1;
+    }
+
     int rx_ifindex = if_nametoindex(RX_IFACE);
     if (!rx_ifindex)
     {
         perror("if_nametoindex(RX)");
         return 1;
     }
+
     int tx_ifindex = if_nametoindex(TX_IFACE);
     if (!tx_ifindex)
     {
@@ -559,11 +583,7 @@ int main(int argc, char **argv)
         perror("socket rx");
         return 1;
     }
-    struct sockaddr_ll rxbind = {
-        .sll_family = AF_PACKET,
-        .sll_protocol = htons(ETH_P_ALL),
-        .sll_ifindex = rx_ifindex,
-    };
+    struct sockaddr_ll rxbind = {.sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_ALL), .sll_ifindex = rx_ifindex};
     if (bind(rx, (struct sockaddr *)&rxbind, sizeof(rxbind)) < 0)
     {
         perror("bind rx");
@@ -579,17 +599,13 @@ int main(int argc, char **argv)
             perror("socket tx");
             return 1;
         }
-        struct sockaddr_ll txbind = {
-            .sll_family = AF_PACKET,
-            .sll_protocol = htons(ETH_P_ALL),
-            .sll_ifindex = tx_ifindex,
-        };
+        struct sockaddr_ll txbind = {.sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_ALL), .sll_ifindex = tx_ifindex};
         if (bind(tx, (struct sockaddr *)&txbind, sizeof(txbind)) < 0)
         {
             perror("bind tx");
             return 1;
         }
-        int snd = 4 * 1024 * 1024; // TX buffer
+        int snd = 4 * 1024 * 1024;
         setsockopt(tx, SOL_SOCKET, SO_SNDBUF, &snd, sizeof(snd));
     }
 
@@ -605,19 +621,10 @@ int main(int argc, char **argv)
         }
     }
 
-    // Parse LOCAL_IP once; used to ignore mirrored traffic not destined to us.
     struct in_addr me = (struct in_addr){0};
     inet_pton(AF_INET, LOCAL_IP, &me);
 
-    // printf("[reinjector] mode=%s RX=%s, TX=%s%s; UOPT=SHA256(key||canonIP||UDPhdr)\n",
-    //    (MODE == MODE_SOURCE ? "source" : "dest"),
-    //    RX_IFACE,
-    //    (MODE == MODE_SOURCE ? TX_IFACE : "(none)"),
-    //    (MODE == MODE_DEST ? ", TUN=" : ""),
-    //    (MODE == MODE_DEST ? TUN_IFACE : ""));
-
-    uint8_t inbuf[65536];
-    uint8_t outbuf[65536];
+    uint8_t inbuf[65536], outbuf[65536];
 
     while (1)
     {
@@ -637,25 +644,22 @@ int main(int argc, char **argv)
         if (MODE == MODE_DEST)
         {
             struct in_addr daddr;
-            memcpy(&daddr, P.ip + 16, 4); // IPv4 dst
-
+            memcpy(&daddr, P.ip + 16, 4);
             if (me.s_addr && daddr.s_addr != me.s_addr)
-                continue; // not for this host ⇒ ignore silently
-
+                continue;
             if (P.sport != DST_PORT && P.dport != DST_PORT)
-                continue; // neither side is 9999 ⇒ ignore
+                continue;
         }
 
-        // Loop avoidance:
         if (MODE == MODE_SOURCE)
         {
             if ((P.tos & 0xFC) != 0)
-                continue; // non-zero DSCP => skip
+                continue;
             if (P.ttl == 63)
-                continue; // our own copies => skip
+                continue;
             struct udp_opt_sha256 tmp;
             if (extract_uopt_tail(&P, inbuf, &tmp))
-                continue; // already has UOPT
+                continue;
         }
 
         int verified_ok = 0;
@@ -665,11 +669,6 @@ int main(int argc, char **argv)
         {
             if (!out_len || !verified_ok)
             {
-                char s[INET_ADDRSTRLEN], d[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, P.ip + 12, s, sizeof(s));
-                inet_ntop(AF_INET, P.ip + 16, d, sizeof(d));
-                // fprintf(stderr, "reject: %s:%u -> %s:%u (hash mismatch or missing UOPT)\n",
-                // s, P.sport, d, P.dport);
                 fflush(stderr);
                 continue;
             }
@@ -682,32 +681,17 @@ int main(int argc, char **argv)
 
         if (MODE == MODE_SOURCE)
         {
-            // Send out via TX_IFACE (use dest MAC from original frame)
-            struct sockaddr_ll sll = {
-                .sll_family = AF_PACKET,
-                .sll_protocol = htons(ETH_P_IP),
-                .sll_ifindex = tx_ifindex,
-                .sll_halen = ETH_ALEN,
-            };
+            struct sockaddr_ll sll = {.sll_family = AF_PACKET, .sll_protocol = htons(ETH_P_IP), .sll_ifindex = tx_ifindex, .sll_halen = ETH_ALEN};
             memcpy(sll.sll_addr, inbuf, 6);
-
             ssize_t sent = sendto(tx, outbuf, out_len, 0, (struct sockaddr *)&sll, sizeof(sll));
             if (sent < 0)
             {
                 perror("sendto");
                 continue;
             }
-
-            char src_ip_s[INET_ADDRSTRLEN], dst_ip_s[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, P.ip + 12, src_ip_s, sizeof(src_ip_s));
-            inet_ntop(AF_INET, P.ip + 16, dst_ip_s, sizeof(dst_ip_s));
-            // printf("src reinj: %s -> %s:%u, +UOPT(sha256), out_len=%zd\n",
-            //    src_ip_s, dst_ip_s, P.dport, sent);
-            fflush(stdout);
         }
         else
         {
-            // DEST: inject into local INPUT via TUN (L3 write: IP header + payload)
             uint8_t *ip = outbuf + P.l3_off;
             uint16_t ip_tot = ((uint16_t)ip[2] << 8) | ip[3];
             ssize_t w = write(tunfd, ip, ip_tot);
@@ -716,14 +700,6 @@ int main(int argc, char **argv)
                 perror("write(tun)");
                 continue;
             }
-
-            char src_ip_s[INET_ADDRSTRLEN], dst_ip_s[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, ip + 12, src_ip_s, sizeof(src_ip_s));
-            inet_ntop(AF_INET, ip + 16, dst_ip_s, sizeof(dst_ip_s));
-            // printf("dst accept→INPUT: %s -> %s:%u, %sUOPT, ip_len=%u\n",
-            //    src_ip_s, dst_ip_s, P.dport,
-            //    STRIP_UOPT_ON_DEST ? "stripped " : "kept ", ip_tot);
-            fflush(stdout);
         }
     }
 
@@ -732,9 +708,7 @@ int main(int argc, char **argv)
     if (tx >= 0)
         close(tx);
     close(rx);
-
     if (g_trie)
         rt_destroy(g_trie);
-
     return 0;
 }
