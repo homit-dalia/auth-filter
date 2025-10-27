@@ -8,7 +8,7 @@ CLIENT_IFACE="eno1"            # interface on bodhi that has CLIENT_BIND_IP
 CLIENT_BIND_IP="192.168.200.2" # must exist on CLIENT_IFACE
 IPERF_PORT=9999                # make sure iperf3 -s on banyan uses this
 DURATION_SEC=10
-TARGET_BW="10000M"
+TARGET_BW="100000M"
 SIZES=(128 256 512 1024 1500 2048 4096 8192)
 # ----------------------
 
