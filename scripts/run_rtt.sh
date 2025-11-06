@@ -3,7 +3,7 @@
 set -u  # (not -e so we can keep going if one test fails)
 
 # ------- config -------
-SERVER_IP="192.168.200.1"   # banyan
+SERVER_IP="192.168.100.1"   # banyan
 SOCKPERF_PORT=9999          # IMPORTANT: reinjector should process this
 CLIENT_IFACE="enp175s0f0np0"  # for labeling/sanity checks
 DURATION_SEC=30

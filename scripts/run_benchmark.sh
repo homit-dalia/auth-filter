@@ -3,9 +3,9 @@
 set -u  # (not -e so we can keep going if one test fails)
 
 # ------- config -------
-SERVER_IP="192.168.200.1"        # banyan
+SERVER_IP="192.168.100.1"        # banyan
 CLIENT_IFACE="enp175s0f0np0"     # interface on bodhi
-CLIENT_BIND_IP="192.168.200.2"   # must exist on CLIENT_IFACE
+CLIENT_BIND_IP="192.168.100.2"   # must exist on CLIENT_IFACE
 IPERF_PORT=9999                  # iperf3 -s on banyan should use this
 DURATION_SEC=30
 BANDWIDTHS=("1G" "10G" "25G" "50G" "100G")
