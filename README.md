@@ -516,11 +516,11 @@ sudo sysctl -w net.ipv4.conf.default.rp_filter=0
 sudo pkill -f af_reinject 2>/dev/null || true
 
 # Delete all egress & ingress filters on eno1
-sudo tc filter del dev 100G_DATA1 egress  2>/dev/null || true
-sudo tc filter del dev 100G_DATA1 ingress 2>/dev/null || true
+sudo tc filter del dev enp175s0f0np0 egress  2>/dev/null || true
+sudo tc filter del dev enp175s0f0np0 ingress 2>/dev/null || true
 
 # Remove the clsact qdisc (removes the egress/ingress hooks)
-sudo tc qdisc del dev 100G_DATA1 clsact   2>/dev/null || true
+sudo tc qdisc del dev enp175s0f0np0 clsact   2>/dev/null || true
 
 # (Optional) Remove helper interfaces if you want a totally clean slate
 sudo ip link set ifb0 down  2>/dev/null || true
@@ -529,8 +529,8 @@ sudo ip link set auth0 down 2>/dev/null || true
 sudo ip link del auth0      2>/dev/null || true
 
 # Verify nothing remains (should show nothing / no filters)
-sudo tc -s filter show dev 100G_DATA1 egress
-sudo tc -s filter show dev 100G_DATA1 ingress
+sudo tc -s filter show dev enp175s0f0np0 egress
+sudo tc -s filter show dev enp175s0f0np0 ingress
 
 
 
@@ -554,10 +554,10 @@ sudo tc -s filter show dev 100G_DATA1 ingress
 sudo modprobe ifb
 ip link show ifb0 >/dev/null 2>&1 || sudo ip link add ifb0 type ifb
 sudo ip link set ifb0 up
-sudo tc qdisc add dev 100G_DATA1 clsact 2>/dev/null || true
+sudo tc qdisc add dev enp175s0f0np0 clsact 2>/dev/null || true
 
 # EGRESS (bodhi→banyan): mirror originals (DSCP=0) then DROP (unchanged)
-sudo tc filter replace dev 100G_DATA1 egress pref 100 protocol ip \
+sudo tc filter replace dev enp175s0f0np0 egress pref 100 protocol ip \
   flower skip_hw ip_proto udp \
   src_ip 192.168.200.2 dst_ip 192.168.200.1 dst_port 9999 \
   ip_tos 0x00/0xFC \
@@ -565,7 +565,7 @@ sudo tc filter replace dev 100G_DATA1 egress pref 100 protocol ip \
   action drop
 
 # INGRESS (banyan→bodhi replies): add skip_hw here
-sudo tc filter replace dev 100G_DATA1 ingress pref 200 protocol ip \
+sudo tc filter replace dev enp175s0f0np0 ingress pref 200 protocol ip \
   flower skip_hw ip_proto udp \
   src_ip 192.168.200.1 src_port 9999 dst_ip 192.168.200.2 \
   action mirred egress mirror dev ifb0 \
@@ -587,17 +587,17 @@ BANYAN
 sudo modprobe ifb
 ip link show ifb0 >/dev/null 2>&1 || sudo ip link add ifb0 type ifb
 sudo ip link set ifb0 up
-sudo tc qdisc add dev 100G_DATA1 clsact 2>/dev/null || true
+sudo tc qdisc add dev enp175s0f0np0 clsact 2>/dev/null || true
 
 # INGRESS (bodhi→banyan): add skip_hw here
-sudo tc filter replace dev 100G_DATA1 ingress pref 100 protocol ip \
+sudo tc filter replace dev enp175s0f0np0 ingress pref 100 protocol ip \
   flower skip_hw ip_proto udp \
   src_ip 192.168.200.2 dst_ip 192.168.200.1 dst_port 9999 \
   action mirred egress mirror dev ifb0 \
   action drop
 
 # EGRESS (banyan→bodhi replies): mirror originals (DSCP=0) then DROP (unchanged)
-sudo tc filter replace dev 100G_DATA1 egress pref 200 protocol ip \
+sudo tc filter replace dev enp175s0f0np0 egress pref 200 protocol ip \
   flower skip_hw ip_proto udp \
   src_ip 192.168.200.1 src_port 9999 dst_ip 192.168.200.2 \
   ip_tos 0x00/0xFC \
