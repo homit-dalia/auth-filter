@@ -133,7 +133,7 @@ static void select_tx_iface(void)
         strncpy(TX_IFACE, env, sizeof(TX_IFACE) - 1);
         return;
     }
-    const char *cands[] = {"eno1", "100G_DATA1", "DATA1"};
+    const char *cands[] = {"eno1", "100G_DATA1", "DATA1", "enp175s0f0np0"};
     for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); ++i)
     {
         if (iface_exists(cands[i]))
