@@ -50,7 +50,6 @@ for sz in "${SIZES[@]}"; do
          --msg-size "${sz}" \
          --time "${DURATION_SEC}" \
          --full-rtt \
-         --json \
          > "${JSON_TMP}" 2> "${ERR_TMP}"; then
     echo "WARN: sockperf failed for size=${sz}; see ${ERR_TMP}"
   fi
