@@ -6,7 +6,7 @@ set -u  # (not -e so we can keep going if one test fails)
 SERVER_IP="192.168.100.1"   # banyan
 SOCKPERF_PORT=9999          # IMPORTANT: reinjector should process this
 CLIENT_IFACE="enp175s0f0np0"  # for labeling/sanity checks
-DURATION_SEC=30
+DURATION_SEC=10
 # sizes up to 65536
 SIZES=(128 256 512 1024 2048 4096 8192 16384 32768 65536)
 # ----------------------

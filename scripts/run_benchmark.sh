@@ -7,7 +7,7 @@ SERVER_IP="192.168.100.1"        # banyan
 CLIENT_IFACE="enp175s0f0np0"     # interface on bodhi
 CLIENT_BIND_IP="192.168.100.2"   # must exist on CLIENT_IFACE
 IPERF_PORT=9999                  # iperf3 -s on banyan should use this
-DURATION_SEC=30
+DURATION_SEC=10
 BANDWIDTHS=("1G" "10G" "25G" "50G" "100G")
 # sizes up to 65536
 SIZES=(128 256 512 1024 2048 4096 8192 16384 32768 65536)
