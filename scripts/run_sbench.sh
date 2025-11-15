@@ -7,13 +7,13 @@ SERVER_IP="192.168.100.1"
 CLIENT_IFACE="enp175s0f0np0"
 CLIENT_BIND_IP="192.168.100.2"
 DURATION_SEC=10
-SIZES=(128 256 512 1024 2048 4096 8192 16384 32768 65536)
+SIZES=(128 256 512 1024 2048 4096 8192 16384 32768 65507)
 # ----------------------
 
 command -v sockperf >/dev/null || { echo "sockperf not found"; exit 1; }
 command -v python3  >/dev/null || { echo "python3 not found"; exit 1; }
 
-# sanity check: interface has that IP
+# sanity check
 if ! ip -4 -o addr show dev "${CLIENT_IFACE}" | grep -q "${CLIENT_BIND_IP}/"; then
   echo "WARNING: ${CLIENT_BIND_IP} not configured on ${CLIENT_IFACE}; sockperf binds may fail."
 fi
@@ -39,10 +39,10 @@ for sz in "${SIZES[@]}"; do
   LOGDIR="${OUTDIR}/logs"
   mkdir -p "${OUTDIR}" "${LOGDIR}"
 
-  JSON_TMP="${LOGDIR}/sockperf_sz${sz}.json"
+  RAW_OUT="${LOGDIR}/sockperf_sz${sz}.txt"
   ERR_TMP="${LOGDIR}/sockperf_sz${sz}.err"
 
-  # Max-rate test (no --pps)
+  # Run sockperf, raw output
   if ! sockperf throughput \
          --client_ip "${CLIENT_BIND_IP}" \
          -i "${SERVER_IP}" \
@@ -50,34 +50,54 @@ for sz in "${SIZES[@]}"; do
          --msg-size "${sz}" \
          --time "${DURATION_SEC}" \
          --full-rtt \
-         > "${JSON_TMP}" 2> "${ERR_TMP}"; then
+         > "${RAW_OUT}" 2> "${ERR_TMP}"; then
     echo "WARN: sockperf failed for size=${sz}; see ${ERR_TMP}"
   fi
 
-  python3 - "${JSON_TMP}" "${sz}" >> "${CSV}" <<'PY'
-import json, sys, time
-jpath, msz = sys.argv[1], sys.argv[2]
+  python3 - "${RAW_OUT}" "${sz}" >> "${CSV}" <<'PY'
+import sys, time, re
+
+raw_path = sys.argv[1]
+msz = sys.argv[2]
 ts = int(time.time())
+
 try:
-    with open(jpath) as f:
-        data = json.load(f)
+    txt = open(raw_path).read()
 except:
     print(f"{ts},max,{msz},,,,,")
     sys.exit(0)
 
-s = data.get("sockperf", {})
-r = s.get("throughput", {})
+# Defaults if parsing fails
+mbps = ""
+pkts = ""
+lost = ""
+loss_pct = ""
+jitter = ""
 
-bps    = r.get("bytes-per-sec", 0) * 8 if r.get("bytes-per-sec") else ""
-loss   = r.get("packet-loss-percent", "")
-pkts   = r.get("sent-msg", "")
-lost   = r.get("dropped-msg", "")
-jitter = r.get("jitter-usec", "")
+# Extract BandWidth Mbps
+m = re.search(r'BandWidth .*?\(([\d.]+)\s*Mbps\)', txt)
+if m:
+    mbps = float(m.group(1)) * 1e6  # convert Mbps → bps
 
-if isinstance(jitter, (int,float)):
-    jitter = jitter / 1000.0
+# Extract messages sent
+m = re.search(r'Total of (\d+)\s+messages sent', txt)
+if m:
+    pkts = m.group(1)
 
-print(f"{ts},max,{msz},{bps},{loss},{pkts},{lost},{jitter}")
+# Extract message rate (msg/sec) — optional but not directly used
+# Extract dropped packets (rare in sockperf throughput)
+m = re.search(r'dropped.*?(\d+)', txt)
+if m:
+    lost = m.group(1)
+
+# Generate loss percent if both present
+try:
+    if pkts and lost:
+        loss_pct = 100 * (int(lost) / int(pkts))
+except:
+    loss_pct = ""
+
+print(f"{ts},max,{msz},{mbps},{loss_pct},{pkts},{lost},{jitter}")
 PY
 
 done
