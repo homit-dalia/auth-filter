@@ -46,7 +46,7 @@ for sz in "${SIZES[@]}"; do
   if ! sockperf throughput \
          --client_ip "${CLIENT_BIND_IP}" \
          -i "${SERVER_IP}" \
-         -p 99999 \
+         -p 9999 \
          --msg-size "${sz}" \
          --time "${DURATION_SEC}" \
          --full-rtt \
