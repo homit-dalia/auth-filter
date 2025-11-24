@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_sockperf_max.sh — UDP throughput sweep using sockperf (max rate)
+# run_sockperf_max.sh — UDP throughput sweep using sockperf (max rate), multi-run
 set -u
 
 # ------- config -------
@@ -24,47 +24,61 @@ case "$(echo "${ans:-n}" | tr '[:upper:]' '[:lower:]')" in
   *)     LABEL="auth_off" ;;
 esac
 
-BASE_OUTDIR="results/${LABEL}/${CLIENT_IFACE}/sockperf_max"
-mkdir -p "${BASE_OUTDIR}"
+# how many runs per size?
+read -r -p "How many runs per msg_size? " RUNS
+if ! [[ "${RUNS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: RUNS must be a positive integer, got '${RUNS}'"
+  exit 1
+fi
 
-CSV="${BASE_OUTDIR}/sockperf_max.csv"
+BASE_ROOT="results/${LABEL}/${CLIENT_IFACE}/sockperf_max"
+mkdir -p "${BASE_ROOT}"
+
+CSV="${BASE_ROOT}/sockperf_max_all_runs.csv"
 : > "${CSV}"
-echo "timestamp,bandwidth_target,msg_size_bytes,bitrate_bps,loss_percent,packets,lost_packets,jitter_ms" >> "${CSV}"
+echo "timestamp,run_index,bandwidth_target,msg_size_bytes,bitrate_bps,loss_percent,packets,lost_packets,jitter_ms" >> "${CSV}"
 
-echo "=== Sockperf max throughput ==="
+echo "=== Sockperf max throughput (multi-run) ==="
+echo "Label=${LABEL}, iface=${CLIENT_IFACE}, runs=${RUNS}"
 
-for sz in "${SIZES[@]}"; do
-  echo "--- msg_size=${sz} ---"
-  OUTDIR="${BASE_OUTDIR}/sz_${sz}"
-  LOGDIR="${OUTDIR}/logs"
-  mkdir -p "${OUTDIR}" "${LOGDIR}"
+for run in $(seq 1 "${RUNS}"); do
+  echo
+  echo "=== Run ${run}/${RUNS} ==="
+  RUN_OUTDIR="${BASE_ROOT}/run_${run}"
 
-  RAW_OUT="${LOGDIR}/sockperf_sz${sz}.txt"
-  ERR_TMP="${LOGDIR}/sockperf_sz${sz}.err"
+  for sz in "${SIZES[@]}"; do
+    echo "--- run=${run}, msg_size=${sz} ---"
+    OUTDIR="${RUN_OUTDIR}/sz_${sz}"
+    LOGDIR="${OUTDIR}/logs"
+    mkdir -p "${OUTDIR}" "${LOGDIR}"
 
-  # Run sockperf, raw output
-  if ! sockperf throughput \
-         --client_ip "${CLIENT_BIND_IP}" \
-         -i "${SERVER_IP}" \
-         -p 9999 \
-         --msg-size "${sz}" \
-         --time "${DURATION_SEC}" \
-         --full-rtt \
-         > "${RAW_OUT}" 2> "${ERR_TMP}"; then
-    echo "WARN: sockperf failed for size=${sz}; see ${ERR_TMP}"
-  fi
+    RAW_OUT="${LOGDIR}/sockperf_sz${sz}.txt"
+    ERR_TMP="${LOGDIR}/sockperf_sz${sz}.err"
 
-  python3 - "${RAW_OUT}" "${sz}" >> "${CSV}" <<'PY'
+    # Run sockperf, raw output
+    if ! sockperf throughput \
+           --client_ip "${CLIENT_BIND_IP}" \
+           -i "${SERVER_IP}" \
+           -p 9999 \
+           --msg-size "${sz}" \
+           --time "${DURATION_SEC}" \
+           --full-rtt \
+           > "${RAW_OUT}" 2> "${ERR_TMP}"; then
+      echo "WARN: sockperf failed (run=${run}, size=${sz}); see ${ERR_TMP}"
+    fi
+
+    python3 - "${RAW_OUT}" "${sz}" "${run}" >> "${CSV}" <<'PY'
 import sys, time, re
 
 raw_path = sys.argv[1]
 msz = sys.argv[2]
+run_idx = sys.argv[3]
 ts = int(time.time())
 
 try:
     txt = open(raw_path).read()
-except:
-    print(f"{ts},max,{msz},,,,,")
+except Exception:
+    print(f"{ts},{run_idx},max,{msz},,,,,")
     sys.exit(0)
 
 # Defaults if parsing fails
@@ -77,32 +91,35 @@ jitter = ""
 # Extract BandWidth Mbps
 m = re.search(r'BandWidth .*?\(([\d.]+)\s*Mbps\)', txt)
 if m:
-    mbps = float(m.group(1)) * 1e6  # convert Mbps → bps
+    try:
+        mbps = float(m.group(1)) * 1e6  # Mbps → bps
+    except Exception:
+        mbps = ""
 
 # Extract messages sent
 m = re.search(r'Total of (\d+)\s+messages sent', txt)
 if m:
     pkts = m.group(1)
 
-# Extract message rate (msg/sec) — optional but not directly used
 # Extract dropped packets (rare in sockperf throughput)
 m = re.search(r'dropped.*?(\d+)', txt)
 if m:
     lost = m.group(1)
 
 # Generate loss percent if both present
-try:
-    if pkts and lost:
+if pkts and lost:
+    try:
         loss_pct = 100 * (int(lost) / int(pkts))
-except:
-    loss_pct = ""
+    except Exception:
+        loss_pct = ""
 
-print(f"{ts},max,{msz},{mbps},{loss_pct},{pkts},{lost},{jitter}")
+print(f"{ts},{run_idx},max,{msz},{mbps},{loss_pct},{pkts},{lost},{jitter}")
 PY
 
+  done
 done
 
 echo
 echo "Done."
-echo "CSV: ${CSV}"
-echo "Raw logs: ${BASE_OUTDIR}/sz_*/logs/"
+echo "CSV (all runs): ${CSV}"
+echo "Raw logs per run/size: ${BASE_ROOT}/run_*/sz_*/logs/"
