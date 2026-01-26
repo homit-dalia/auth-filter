@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# run_iperf_global.sh — one script for:
-# - auth ON:   config.sh host + make run_both_* + iperf server OR sender sweep
-# - auth OFF:  config.sh clean (no make) + iperf server OR sender sweep
+# run_iperf_global.sh (TCP)
+# - auth ON:   config.sh host + (override tc filters to TCP) + make run_both_* + iperf3 server OR sender sweep
+# - auth OFF:  config.sh clean (no make) + iperf3 server OR sender sweep
 #
-# Key changes:
-# - ONE run folder per invocation (timestamped) that contains ALL logs/results for that role
-# - RUNS is user input
-# - Server "marks" each run/size by capturing a few packets with tcpdump and saving per-size files
-# - Sender logs + CSV saved in same run folder too
+# One run folder per invocation (timestamped) containing all logs/results for that role.
+# RUNS is user input.
 #
-# Fixed per request:
-#   bandwidth = 100G
+# TCP notes:
+# - iperf3 TCP has no jitter/loss. We log server-side Transfer + Bitrate from the SERVER "receiver" line
+#   using --get-server-output.
+# - BANDWIDTH is kept only as a label (iperf3 TCP ignores -b).
+#
+# Fixed:
 #   duration  = 10s
 #   sizes     = 128..8192
+#   bandwidth label = 100G (not used by TCP)
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -21,8 +23,9 @@ IFS=$'\n\t'
 IFACE="${IFACE:-enp175s0f0np0}"
 PORT="${PORT:-9999}"
 DURATION_SEC=10
-BANDWIDTH="100G"
+BANDWIDTH_LABEL="100G"                 # TCP ignores -b; kept for labeling
 SIZES=(128 256 512 1024 2048 4096 8192)
+PARALLEL_STREAMS="${PARALLEL_STREAMS:-1}"  # TCP: increase (e.g., 8/16) to try to hit higher rates
 # --------------------------------------
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not found"; exit 1; }; }
@@ -79,42 +82,50 @@ yn() {
   case "$ans" in y|yes) return 0 ;; *) return 1 ;; esac
 }
 
-parse_receiver_line_to_csv() {
+# Parse TCP receiver line from server output:
+# Returns: transfer_bytes,bitrate_bps
+parse_tcp_receiver_to_csv() {
   local raw_file="$1"
   python3 - "$raw_file" <<'PY'
 import re, sys
 
 path = sys.argv[1]
-txt = open(path, 'r', errors='ignore').read().splitlines()
+lines = open(path, 'r', errors='ignore').read().splitlines()
 
 recv = None
-for line in txt:
+for line in lines:
     if line.strip().endswith("receiver"):
         recv = line
 
 if not recv:
-    print(",,,,")
+    print(",")  # transfer_bytes,bitrate_bps
     sys.exit(0)
 
-m = re.search(r'\s([\d.]+)\s*([KMG]?bits/sec)\s+([\d.]+)\s*ms\s+(\d+)\s*/\s*(\d+)\s*\(([\d.]+)%\)', recv)
+# Typical TCP receiver summary:
+# [  5]   0.00-10.00  sec  2.68 GBytes  2.30 Gbits/sec                  receiver
+m = re.search(r'\s([\d.]+)\s*([KMG]?Bytes)\s+([\d.]+)\s*([KMG]?bits/sec)\s+.*receiver$', recv)
 if not m:
-    print(",,,,")
+    print(",")
     sys.exit(0)
 
-val = float(m.group(1))
-unit = m.group(2)
-jitter = m.group(3)
-lost = m.group(4)
-total = m.group(5)
-loss = m.group(6)
+t_val = float(m.group(1))
+t_unit = m.group(2)
+b_val = float(m.group(3))
+b_unit = m.group(4)
 
-mul = 1.0
-if unit.startswith("K"): mul = 1e3
-elif unit.startswith("M"): mul = 1e6
-elif unit.startswith("G"): mul = 1e9
+t_mul = 1.0
+if t_unit.startswith("K"): t_mul = 1e3
+elif t_unit.startswith("M"): t_mul = 1e6
+elif t_unit.startswith("G"): t_mul = 1e9
 
-bps = val * mul
-print(f"{bps},{jitter},{lost},{total},{loss}")
+b_mul = 1.0
+if b_unit.startswith("K"): b_mul = 1e3
+elif b_unit.startswith("M"): b_mul = 1e6
+elif b_unit.startswith("G"): b_mul = 1e9
+
+transfer_bytes = t_val * t_mul
+bitrate_bps = b_val * b_mul
+print(f"{transfer_bytes},{bitrate_bps}")
 PY
 }
 
@@ -129,19 +140,49 @@ auth_clean_only() {
   sudo pkill -f af_reinject 2>/dev/null || true
 }
 
+# IMPORTANT: your config.sh installs UDP flower filters.
+# For TCP tests, we override those tc filters to ip_proto tcp.
+install_tcp_filters_override() {
+  local host_ip="$1"
+  local peer_ip="$2"
+
+  echo "[auth_on] Overriding tc filters to TCP (port ${PORT}) on ${IFACE}"
+  echo "          HOST_IP=${host_ip} PEER_IP=${peer_ip}"
+
+  # EGRESS (HOST -> PEER): mirror+drop ONLY DSCP=0 originals
+  sudo tc filter replace dev "$IFACE" egress pref 100 protocol ip \
+    flower skip_hw ip_proto tcp \
+    src_ip "$host_ip" dst_ip "$peer_ip" dst_port "$PORT" \
+    ip_tos 0x00/0xFC \
+    action mirred egress mirror dev ifb0 pipe \
+    action gact drop
+
+  # INGRESS (PEER -> HOST): mirror+drop ALL (captures reinjected DSCP=EF too)
+  sudo tc filter replace dev "$IFACE" ingress pref 200 protocol ip \
+    flower skip_hw ip_proto tcp \
+    src_ip "$peer_ip" src_port "$PORT" dst_ip "$host_ip" \
+    action mirred egress mirror dev ifb0 pipe \
+    action gact drop
+
+  echo "[auth_on] tc filters (ingress):"
+  sudo tc -s filter show dev "$IFACE" ingress || true
+  echo "[auth_on] tc filters (egress):"
+  sudo tc -s filter show dev "$IFACE" egress || true
+}
+
 auth_start_on_this_node() {
   local host_ip="$1"
-  if [[ ! -x ./config.sh ]]; then
-    echo "ERROR: ./config.sh not found or not executable"
-    exit 1
-  fi
+  local peer_ip="$2"
+
+  [[ -x ./config.sh ]] || { echo "ERROR: ./config.sh not found or not executable"; exit 1; }
+
   echo "[auth_on] sudo ./config.sh host"
   sudo ./config.sh host
 
-  if [[ ! -f makefile ]]; then
-    echo "ERROR: Makefile not found (needed to start af_reinject via make run_both_*)"
-    exit 1
-  fi
+  # Override UDP tc rules with TCP ones
+  install_tcp_filters_override "$host_ip" "$peer_ip"
+
+  [[ -f Makefile ]] || { echo "ERROR: Makefile not found (needed to start af_reinject via make run_both_*)"; exit 1; }
   need_cmd make
 
   if [[ "$host_ip" == "192.168.100.1" ]]; then
@@ -156,25 +197,8 @@ auth_start_on_this_node() {
   fi
 }
 
-start_server_background() {
-  local logfile="$1"
-  echo "[server] Starting iperf3 server in background..."
-  # --logfile writes continuously; keep in background
-  sudo iperf3 -s -p "$PORT" --logfile "$logfile" >/dev/null 2>&1 &
-  echo $!  # return PID
-}
-
-stop_server_background() {
-  local pid="$1"
-  if [[ -n "${pid:-}" ]]; then
-    echo "[server] Stopping iperf3 server pid=$pid"
-    sudo kill "$pid" 2>/dev/null || true
-  fi
-}
-
 server_marker_capture() {
-  # Capture a few packets on server to "mark" size/run window.
-  # Writes both pcap and decoded text.
+  # Capture a few packets on server to "mark" traffic windows (TCP).
   local outdir="$1"
   local run="$2"
   local sz="$3"
@@ -187,9 +211,7 @@ server_marker_capture() {
   local pcap="${mdir}/run_${run}_sz_${sz}.pcap"
   local txt="${mdir}/run_${run}_sz_${sz}.txt"
 
-  # Capture small number of packets quickly. If none arrive, files still exist (or tcpdump returns nonzero).
-  sudo timeout 3 tcpdump -ni "$IFACE" udp port "$PORT" -c 8 -w "$pcap" >/dev/null 2>&1 || true
-  # Decode what we got, include lengths
+  sudo timeout 3 tcpdump -ni "$IFACE" tcp port "$PORT" -c 20 -w "$pcap" >/dev/null 2>&1 || true
   sudo tcpdump -nn -tt -vv -r "$pcap" > "$txt" 2>/dev/null || true
 }
 
@@ -207,14 +229,16 @@ run_server_mode() {
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "fixed: duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
+    echo "TCP mode"
+    echo "fixed: duration=${DURATION_SEC}s bandwidth_label=${BANDWIDTH_LABEL}"
+    echo "parallel_streams=${PARALLEL_STREAMS}"
     echo "sizes=${SIZES[*]}"
   } > "${outdir}/meta_server.txt"
 
   local logfile="${outdir}/iperf3_server.log"
 
   echo
-  echo "== SERVER MODE =="
+  echo "== SERVER MODE (TCP) =="
   echo "Run folder: $outdir"
   echo "Logging server output to: $logfile"
   echo "Listening on: ${host_ip}:${PORT}"
@@ -240,20 +264,22 @@ run_sender_mode() {
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "fixed: duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
+    echo "TCP mode"
+    echo "fixed: duration=${DURATION_SEC}s bandwidth_label=${BANDWIDTH_LABEL}"
     echo "runs=${runs}"
+    echo "parallel_streams=${PARALLEL_STREAMS}"
     echo "sizes=${SIZES[*]}"
   } > "${outdir}/meta_sender.txt"
 
   local csv="${outdir}/results.csv"
   : > "$csv"
-  echo "timestamp,run_index,msg_size_bytes,bandwidth_arg,server_bitrate_bps,server_jitter_ms,server_lost,server_total,server_loss_percent" >> "$csv"
+  echo "timestamp,run_index,msg_size_bytes,parallel_streams,duration_sec,transfer_bytes,server_bitrate_bps" >> "$csv"
 
   echo
-  echo "== SENDER MODE =="
+  echo "== SENDER MODE (TCP) =="
   echo "Run folder: $outdir"
   echo "Target: ${peer_ip}:${PORT}"
-  echo "Params: runs=${runs} duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
+  echo "Params: runs=${runs} duration=${DURATION_SEC}s parallel=${PARALLEL_STREAMS} (bandwidth_label=${BANDWIDTH_LABEL}, TCP ignores -b)"
   echo
 
   for run in $(seq 1 "$runs"); do
@@ -263,24 +289,23 @@ run_sender_mode() {
       mkdir -p "$logdir"
       local raw="${logdir}/iperf3_raw.txt"
 
-      # Sender logs the command too
       {
-        echo "cmd: iperf3 -c $peer_ip -p $PORT -u --cport $PORT -l $sz -t $DURATION_SEC -b $BANDWIDTH --get-server-output"
+        echo "cmd: iperf3 -c $peer_ip -p $PORT --cport $PORT -l $sz -t $DURATION_SEC -P $PARALLEL_STREAMS --get-server-output"
         echo "start_ts: $(date +%s)"
       } > "${logdir}/meta.txt"
 
-      # IMPORTANT: --cport 9999 so auth-mode ingress match (src_port 9999) works.
-      if ! iperf3 -c "$peer_ip" -p "$PORT" -u \
+      # TCP client -> server. Keep --cport=PORT to keep 9999 source port for tc ingress match.
+      if ! iperf3 -c "$peer_ip" -p "$PORT" \
           --cport "$PORT" \
-          -l "$sz" -t "$DURATION_SEC" -b "$BANDWIDTH" \
+          -l "$sz" -t "$DURATION_SEC" -P "$PARALLEL_STREAMS" \
           --get-server-output \
           >"$raw" 2>&1; then
         echo "[warn] iperf3 failed (run=$run size=$sz). See: $raw"
       fi
 
       local ts; ts="$(date +%s)"
-      local parsed; parsed="$(parse_receiver_line_to_csv "$raw")"
-      echo "${ts},${run},${sz},${BANDWIDTH},${parsed}" >> "$csv"
+      local parsed; parsed="$(parse_tcp_receiver_to_csv "$raw")"  # transfer_bytes,bitrate_bps
+      echo "${ts},${run},${sz},${PARALLEL_STREAMS},${DURATION_SEC},${parsed}" >> "$csv"
     done
   done
 
@@ -292,7 +317,7 @@ run_sender_mode() {
 
 main() {
   echo "IFACE=$IFACE PORT=$PORT"
-  echo "Fixed: duration=${DURATION_SEC}s bandwidth=$BANDWIDTH sizes=${SIZES[*]}"
+  echo "TCP: duration=${DURATION_SEC}s bandwidth_label=${BANDWIDTH_LABEL} parallel=${PARALLEL_STREAMS} sizes=${SIZES[*]}"
   echo
 
   local host_ip; host_ip="$(get_iface_ipv4 "$IFACE" || true)"
@@ -305,31 +330,26 @@ main() {
   local label="auth_off"
   if yn "Auth enabled? [y/N]: "; then label="auth_on"; fi
 
-  # ONE folder per run on this node
   local stamp; stamp="$(ts_folder)"
   echo "Run folder timestamp: $stamp"
   echo
 
-  # Runs is dynamic (only used in sender mode; server mode just runs forever)
   local runs=1
   if [[ "$role" == "sender" ]]; then
     runs="$(ask_int "How many runs per msg_size?" "32")"
   fi
 
-  # Setup auth or clean, per label, on THIS node
   if [[ "$label" == "auth_on" ]]; then
-    auth_start_on_this_node "$host_ip"
+    auth_start_on_this_node "$host_ip" "$peer_ip"
   else
     auth_clean_only
   fi
 
   if [[ "$role" == "server" ]]; then
-    # Server mode: runs iperf3 server in foreground; sender handles sweep
     run_server_mode "$label" "$host_ip" "$stamp"
     exit 0
   fi
 
-  # Sender mode: do sweep + also create "sender logs" naturally in folder
   run_sender_mode "$label" "$host_ip" "$peer_ip" "$stamp" "$runs"
 }
 
