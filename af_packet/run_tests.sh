@@ -315,6 +315,32 @@ run_sender_mode() {
   echo "Raw logs: $outdir/run_*/sz_*/iperf3_raw.txt"
 }
 
+kill_all_iperf3() {
+  echo "[prep] Killing any running iperf3 (best effort)..."
+
+  # Kill any iperf3 process
+  sudo pkill -9 iperf3 2>/dev/null || true
+
+  # Kill anything holding our port (TCP)
+  if command -v fuser >/dev/null 2>&1; then
+    sudo fuser -k -n tcp "$PORT" 2>/dev/null || true
+  fi
+
+  # Fallback: lsof
+  if command -v lsof >/dev/null 2>&1; then
+    local pids
+    pids="$(sudo lsof -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "${pids:-}" ]]; then
+      echo "[prep] Killing LISTEN pids on tcp/$PORT: $pids"
+      sudo kill -9 $pids 2>/dev/null || true
+    fi
+  fi
+
+  echo "[prep] Done. Current listeners on tcp/$PORT:"
+  sudo ss -ltnp "( sport = :$PORT )" 2>/dev/null || true
+}
+
+
 main() {
   echo "IFACE=$IFACE PORT=$PORT"
   echo "TCP: duration=${DURATION_SEC}s bandwidth_label=${BANDWIDTH_LABEL} parallel=${PARALLEL_STREAMS} sizes=${SIZES[*]}"
@@ -338,6 +364,8 @@ main() {
   if [[ "$role" == "sender" ]]; then
     runs="$(ask_int "How many runs per msg_size?" "32")"
   fi
+
+  kill_all_iperf3
 
   if [[ "$label" == "auth_on" ]]; then
     auth_start_on_this_node "$host_ip" "$peer_ip"
