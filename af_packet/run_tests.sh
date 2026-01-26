@@ -138,7 +138,7 @@ auth_start_on_this_node() {
   echo "[auth_on] sudo ./config.sh host"
   sudo ./config.sh host
 
-  if [[ ! -f Makefile ]]; then
+  if [[ ! -f makefile ]]; then
     echo "ERROR: Makefile not found (needed to start af_reinject via make run_both_*)"
     exit 1
   fi
