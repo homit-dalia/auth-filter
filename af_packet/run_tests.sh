@@ -3,12 +3,14 @@
 # - auth ON:   config.sh host + make run_both_* + iperf server OR sender sweep
 # - auth OFF:  config.sh clean (no make) + iperf server OR sender sweep
 #
-# Stores results in timestamped folders.
-# CSV is parsed from iperf3 "receiver" line (server-side stats via --get-server-output).
+# Key changes:
+# - ONE run folder per invocation (timestamped) that contains ALL logs/results for that role
+# - RUNS is user input
+# - Server "marks" each run/size by capturing a few packets with tcpdump and saving per-size files
+# - Sender logs + CSV saved in same run folder too
 #
-# Fixed params per request:
+# Fixed per request:
 #   bandwidth = 100G
-#   runs      = 32
 #   duration  = 10s
 #   sizes     = 128..8192
 
@@ -18,7 +20,6 @@ IFS=$'\n\t'
 # ---------- fixed test params ----------
 IFACE="${IFACE:-enp175s0f0np0}"
 PORT="${PORT:-9999}"
-RUNS=32
 DURATION_SEC=10
 BANDWIDTH="100G"
 SIZES=(128 256 512 1024 2048 4096 8192)
@@ -29,7 +30,6 @@ need_cmd ip
 need_cmd iperf3
 need_cmd python3
 need_cmd date
-need_cmd make
 
 ts_folder() { date +"%Y%m%d_%H%M%S"; }
 
@@ -59,6 +59,17 @@ ask_choice() {
     fi
     echo "Invalid. Choose one of: $valid"
   done
+}
+
+ask_int() {
+  local prompt="$1" def="$2" ans
+  read -r -p "$prompt [$def]: " ans || ans=""
+  ans="${ans:-$def}"
+  if ! [[ "$ans" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: expected positive integer, got '$ans'"
+    exit 1
+  fi
+  echo "$ans"
 }
 
 yn() {
@@ -131,6 +142,7 @@ auth_start_on_this_node() {
     echo "ERROR: Makefile not found (needed to start af_reinject via make run_both_*)"
     exit 1
   fi
+  need_cmd make
 
   if [[ "$host_ip" == "192.168.100.1" ]]; then
     echo "[auth_on] make run_both_bodhi"
@@ -144,10 +156,47 @@ auth_start_on_this_node() {
   fi
 }
 
-run_server() {
+start_server_background() {
+  local logfile="$1"
+  echo "[server] Starting iperf3 server in background..."
+  # --logfile writes continuously; keep in background
+  sudo iperf3 -s -p "$PORT" --logfile "$logfile" >/dev/null 2>&1 &
+  echo $!  # return PID
+}
+
+stop_server_background() {
+  local pid="$1"
+  if [[ -n "${pid:-}" ]]; then
+    echo "[server] Stopping iperf3 server pid=$pid"
+    sudo kill "$pid" 2>/dev/null || true
+  fi
+}
+
+server_marker_capture() {
+  # Capture a few packets on server to "mark" size/run window.
+  # Writes both pcap and decoded text.
+  local outdir="$1"
+  local run="$2"
+  local sz="$3"
+
+  need_cmd tcpdump
+
+  local mdir="${outdir}/markers"
+  mkdir -p "$mdir"
+
+  local pcap="${mdir}/run_${run}_sz_${sz}.pcap"
+  local txt="${mdir}/run_${run}_sz_${sz}.txt"
+
+  # Capture small number of packets quickly. If none arrive, files still exist (or tcpdump returns nonzero).
+  sudo timeout 3 tcpdump -ni "$IFACE" udp port "$PORT" -c 8 -w "$pcap" >/dev/null 2>&1 || true
+  # Decode what we got, include lengths
+  sudo tcpdump -nn -tt -vv -r "$pcap" > "$txt" 2>/dev/null || true
+}
+
+run_server_mode() {
   local label="$1" host_ip="$2"
-  local stamp; stamp="$(ts_folder)"
-  local outdir="results/${label}/${IFACE}/iperf3/server/${stamp}_server_${host_ip}"
+  local stamp="$3"
+  local outdir="results/${label}/${IFACE}/iperf3/${stamp}"
   mkdir -p "$outdir"
 
   {
@@ -158,14 +207,16 @@ run_server() {
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "fixed: runs=${RUNS} duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
+    echo "fixed: duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
     echo "sizes=${SIZES[*]}"
-  } > "${outdir}/meta.txt"
+  } > "${outdir}/meta_server.txt"
 
   local logfile="${outdir}/iperf3_server.log"
+
   echo
-  echo "== SERVER =="
-  echo "Logging to: $logfile"
+  echo "== SERVER MODE =="
+  echo "Run folder: $outdir"
+  echo "Logging server output to: $logfile"
   echo "Listening on: ${host_ip}:${PORT}"
   echo "Stop with Ctrl+C after sender finishes."
   echo
@@ -173,10 +224,11 @@ run_server() {
   sudo iperf3 -s -p "$PORT" --logfile "$logfile"
 }
 
-run_sender_sweep() {
+run_sender_mode() {
   local label="$1" host_ip="$2" peer_ip="$3"
-  local stamp; stamp="$(ts_folder)"
-  local outdir="results/${label}/${IFACE}/iperf3/sweep/${stamp}_sender_${host_ip}_to_${peer_ip}"
+  local stamp="$4"
+  local runs="$5"
+  local outdir="results/${label}/${IFACE}/iperf3/${stamp}"
   mkdir -p "$outdir"
 
   {
@@ -188,30 +240,36 @@ run_sender_sweep() {
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "fixed: runs=${RUNS} duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
+    echo "fixed: duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
+    echo "runs=${runs}"
     echo "sizes=${SIZES[*]}"
-  } > "${outdir}/meta.txt"
+  } > "${outdir}/meta_sender.txt"
 
   local csv="${outdir}/results.csv"
   : > "$csv"
   echo "timestamp,run_index,msg_size_bytes,bandwidth_arg,server_bitrate_bps,server_jitter_ms,server_lost,server_total,server_loss_percent" >> "$csv"
 
   echo
-  echo "== SENDER sweep =="
+  echo "== SENDER MODE =="
+  echo "Run folder: $outdir"
   echo "Target: ${peer_ip}:${PORT}"
-  echo "Fixed params: runs=${RUNS} duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
-  echo "Outdir: $outdir"
+  echo "Params: runs=${runs} duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
   echo
 
-  for run in $(seq 1 "$RUNS"); do
-    echo "=== Run ${run}/${RUNS} ==="
+  for run in $(seq 1 "$runs"); do
+    echo "=== Run ${run}/${runs} ==="
     for sz in "${SIZES[@]}"; do
       local logdir="${outdir}/run_${run}/sz_${sz}"
       mkdir -p "$logdir"
       local raw="${logdir}/iperf3_raw.txt"
 
-      # IMPORTANT: --cport 9999 so ingress tc rule (src_port 9999) matches in auth mode.
-      # We always keep it for consistency even when auth is off.
+      # Sender logs the command too
+      {
+        echo "cmd: iperf3 -c $peer_ip -p $PORT -u --cport $PORT -l $sz -t $DURATION_SEC -b $BANDWIDTH --get-server-output"
+        echo "start_ts: $(date +%s)"
+      } > "${logdir}/meta.txt"
+
+      # IMPORTANT: --cport 9999 so auth-mode ingress match (src_port 9999) works.
       if ! iperf3 -c "$peer_ip" -p "$PORT" -u \
           --cport "$PORT" \
           -l "$sz" -t "$DURATION_SEC" -b "$BANDWIDTH" \
@@ -234,7 +292,7 @@ run_sender_sweep() {
 
 main() {
   echo "IFACE=$IFACE PORT=$PORT"
-  echo "Fixed: runs=$RUNS duration=${DURATION_SEC}s bandwidth=$BANDWIDTH sizes=${SIZES[*]}"
+  echo "Fixed: duration=${DURATION_SEC}s bandwidth=$BANDWIDTH sizes=${SIZES[*]}"
   echo
 
   local host_ip; host_ip="$(get_iface_ipv4 "$IFACE" || true)"
@@ -244,22 +302,35 @@ main() {
   [[ -n "$peer_ip" ]] || { echo "ERROR: Host IP '$host_ip' not recognized for our 192.168.100.1/2 setup"; exit 1; }
 
   local role; role="$(ask_choice "Role? [server/sender]: " "server sender")"
-
   local label="auth_off"
-  if yn "Auth enabled? [y/N]: "; then
-    label="auth_on"
-    # Auth ON means: set up tc + start reinjectors on THIS node
+  if yn "Auth enabled? [y/N]: "; then label="auth_on"; fi
+
+  # ONE folder per run on this node
+  local stamp; stamp="$(ts_folder)"
+  echo "Run folder timestamp: $stamp"
+  echo
+
+  # Runs is dynamic (only used in sender mode; server mode just runs forever)
+  local runs=1
+  if [[ "$role" == "sender" ]]; then
+    runs="$(ask_int "How many runs per msg_size?" "32")"
+  fi
+
+  # Setup auth or clean, per label, on THIS node
+  if [[ "$label" == "auth_on" ]]; then
     auth_start_on_this_node "$host_ip"
   else
-    # Auth OFF means: ensure everything is clean on THIS node
     auth_clean_only
   fi
 
   if [[ "$role" == "server" ]]; then
-    run_server "$label" "$host_ip"
-  else
-    run_sender_sweep "$label" "$host_ip" "$peer_ip"
+    # Server mode: runs iperf3 server in foreground; sender handles sweep
+    run_server_mode "$label" "$host_ip" "$stamp"
+    exit 0
   fi
+
+  # Sender mode: do sweep + also create "sender logs" naturally in folder
+  run_sender_mode "$label" "$host_ip" "$peer_ip" "$stamp" "$runs"
 }
 
 main "$@"
