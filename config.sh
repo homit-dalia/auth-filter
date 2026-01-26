@@ -1,29 +1,61 @@
 #!/usr/bin/env bash
-# tc_auth.sh — clean / server / client setup for mirroring+drop via ifb0 on a given iface
-# Usage:
-#   sudo ./tc_auth.sh clean  [IFACE]
-#   sudo ./tc_auth.sh server [IFACE] [SERVER_IP] [CLIENT_IP] [PORT]
-#   sudo ./tc_auth.sh client [IFACE] [SERVER_IP] [CLIENT_IP] [PORT]
+# tc_auth.sh — clean / host setup for bidirectional mirroring+drop via ifb0 on a given iface
 #
-# Defaults match your ORBIT test:
-#   IFACE=enp175s0f0np0, SERVER_IP=192.168.100.1, CLIENT_IP=192.168.100.2, PORT=9999
-# If you’re on the older 192.168.200.x setup, just pass those instead.
+# Usage:
+#   sudo ./tc_auth.sh clean
+#   sudo ./tc_auth.sh host
+#
+# Auto-detects HOST_IP from IFACE (default enp175s0f0np0) and sets PEER_IP
+# assuming our setup:
+#   node1-4: 192.168.100.1
+#   node1-6: 192.168.100.2
+#
+# Overrides (optional):
+#   IFACE=enp175s0f0np0 PORT=9999 PEER_IP=192.168.100.2 sudo ./tc_auth.sh host
 
 set -euo pipefail
 
 ROLE="${1:-}"
-IFACE="${2:-enp175s0f0np0}"
-SERVER_IP="${3:-192.168.100.1}"
-CLIENT_IP="${4:-192.168.100.2}"
-PORT="${5:-9999}"
-
 SUDO="${SUDO:-sudo}"
+
+# Defaults (can be overridden via env)
+IFACE="${IFACE:-enp175s0f0np0}"
+PORT="${PORT:-9999}"
 
 need_root() {
   if [[ $EUID -ne 0 ]]; then
     echo "Re-running with sudo..."
-    exec sudo SUDO= $0 "$ROLE" "$IFACE" "$SERVER_IP" "$CLIENT_IP" "$PORT"
+    exec sudo SUDO= $0 "$ROLE"
   fi
+}
+
+get_iface_ipv4() {
+  local iface="$1"
+  ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
+}
+
+auto_pick_ips() {
+  HOST_IP="$(get_iface_ipv4 "$IFACE" || true)"
+  if [[ -z "${HOST_IP:-}" ]]; then
+    echo "[error] Could not detect IPv4 address on IFACE=$IFACE"
+    echo "        Run: ip -4 -o addr show dev $IFACE"
+    exit 1
+  fi
+
+  # Allow explicit override
+  if [[ -n "${PEER_IP:-}" ]]; then
+    return
+  fi
+
+  case "$HOST_IP" in
+    192.168.100.1) PEER_IP="192.168.100.2" ;;
+    192.168.100.2) PEER_IP="192.168.100.1" ;;
+    *)
+      echo "[error] HOST_IP=$HOST_IP not recognized for our setup."
+      echo "        Set PEER_IP manually: PEER_IP=... sudo ./tc_auth.sh host"
+      exit 1
+      ;;
+  esac
 }
 
 clean_all() {
@@ -63,44 +95,23 @@ common_setup() {
   $SUDO sysctl -q -w net.ipv4.conf.default.rp_filter=0
 }
 
-install_server() {
-  echo "== SERVER filters (HOST=${SERVER_IP}, PEER=${CLIENT_IP}, IFACE=${IFACE}, PORT=${PORT}) =="
+install_host_bidirectional() {
+  echo "== HOST bidirectional filters =="
+  echo "   IFACE=${IFACE} PORT=${PORT}"
+  echo "   HOST_IP=${HOST_IP} PEER_IP=${PEER_IP}"
 
-  # INGRESS (client -> server requests): mirror then drop
-  $SUDO tc filter replace dev "$IFACE" ingress pref 100 protocol ip \
-    flower skip_hw ip_proto udp \
-    src_ip "$CLIENT_IP" dst_ip "$SERVER_IP" dst_port "$PORT" \
-    action mirred egress mirror dev ifb0 pipe \
-    action gact drop
-
-  # EGRESS (server -> client replies, originals only DSCP=0): mirror then drop
-  $SUDO tc filter replace dev "$IFACE" egress pref 200 protocol ip \
-    flower skip_hw ip_proto udp \
-    src_ip "$SERVER_IP" src_port "$PORT" dst_ip "$CLIENT_IP" \
-    ip_tos 0x00/0xFC \
-    action mirred egress mirror dev ifb0 pipe \
-    action gact drop
-
-  echo "-- Installed filters --"
-  $SUDO tc -s filter show dev "$IFACE" ingress
-  $SUDO tc -s filter show dev "$IFACE" egress
-}
-
-install_client() {
-  echo "== CLIENT filters (HOST=${CLIENT_IP}, PEER=${SERVER_IP}, IFACE=${IFACE}, PORT=${PORT}) =="
-
-  # EGRESS (client -> server requests, originals only DSCP=0): mirror then drop
+  # EGRESS (HOST -> PEER): mirror+drop ONLY DSCP=0 originals
   $SUDO tc filter replace dev "$IFACE" egress pref 100 protocol ip \
     flower skip_hw ip_proto udp \
-    src_ip "$CLIENT_IP" dst_ip "$SERVER_IP" dst_port "$PORT" \
+    src_ip "$HOST_IP" dst_ip "$PEER_IP" dst_port "$PORT" \
     ip_tos 0x00/0xFC \
     action mirred egress mirror dev ifb0 pipe \
     action gact drop
 
-  # INGRESS (server -> client replies): mirror then drop
+  # INGRESS (PEER -> HOST): mirror+drop ALL (captures reinjected DSCP=EF too)
   $SUDO tc filter replace dev "$IFACE" ingress pref 200 protocol ip \
     flower skip_hw ip_proto udp \
-    src_ip "$SERVER_IP" src_port "$PORT" dst_ip "$CLIENT_IP" \
+    src_ip "$PEER_IP" src_port "$PORT" dst_ip "$HOST_IP" \
     action mirred egress mirror dev ifb0 pipe \
     action gact drop
 
@@ -112,36 +123,27 @@ install_client() {
 usage() {
   cat <<EOF
 Usage:
-  sudo $0 clean  [IFACE]
-  sudo $0 server [IFACE] [SERVER_IP] [CLIENT_IP] [PORT]
-  sudo $0 client [IFACE] [SERVER_IP] [CLIENT_IP] [PORT]
+  sudo $0 clean
+  sudo $0 host
 
-Defaults:
-  IFACE=enp175s0f0np0  SERVER_IP=192.168.100.1  CLIENT_IP=192.168.100.2  PORT=9999
-
-Examples:
-  sudo $0 clean  enp175s0f0np0
-  sudo $0 server enp175s0f0np0 192.168.100.1 192.168.100.2 9999
-  sudo $0 client enp175s0f0np0 192.168.100.1 192.168.100.2 9999
+Env overrides (optional):
+  IFACE=enp175s0f0np0 PORT=9999 PEER_IP=192.168.100.2 sudo $0 host
 EOF
 }
 
 main() {
   [[ -n "$ROLE" ]] || { usage; exit 2; }
   need_root
+
   case "$ROLE" in
     clean)
       clean_all
       ;;
-    server)
+    host)
+      auto_pick_ips
       clean_all
       common_setup
-      install_server
-      ;;
-    client)
-      clean_all
-      common_setup
-      install_client
+      install_host_bidirectional
       ;;
     *)
       usage; exit 2;;
