@@ -1,20 +1,19 @@
 #!/usr/bin/env bash
-# run_iperf_global.sh (TCP)
-# - auth ON:   config.sh host + (override tc filters to TCP) + make run_both_* + iperf3 server OR sender sweep
+# run_iperf_global.sh (UDP)
+# - auth ON:   config.sh host + make run_both_* + iperf3 server OR sender sweep
 # - auth OFF:  config.sh clean (no make) + iperf3 server OR sender sweep
 #
 # One run folder per invocation (timestamped) containing all logs/results for that role.
-# RUNS is user input.
+# RUNS is user input (sender mode).
 #
-# TCP notes:
-# - iperf3 TCP has no jitter/loss. We log server-side Transfer + Bitrate from the SERVER "receiver" line
-#   using --get-server-output.
-# - BANDWIDTH is kept only as a label (iperf3 TCP ignores -b).
+# UDP notes:
+# - iperf3 UDP reports jitter/loss. We log SERVER "receiver" line stats using --get-server-output.
+# - We keep --cport=$PORT so tc ingress match (src_port $PORT) can work in auth mode.
 #
 # Fixed:
 #   duration  = 10s
+#   bandwidth = 100G
 #   sizes     = 128..8192
-#   bandwidth label = 100G (not used by TCP)
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -23,9 +22,8 @@ IFS=$'\n\t'
 IFACE="${IFACE:-enp175s0f0np0}"
 PORT="${PORT:-9999}"
 DURATION_SEC=10
-BANDWIDTH_LABEL="100G"                 # TCP ignores -b; kept for labeling
+BANDWIDTH="100G"
 SIZES=(128 256 512 1024 2048 4096 8192)
-PARALLEL_STREAMS="${PARALLEL_STREAMS:-1}"  # TCP: increase (e.g., 8/16) to try to hit higher rates
 # --------------------------------------
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not found"; exit 1; }; }
@@ -82,9 +80,9 @@ yn() {
   case "$ans" in y|yes) return 0 ;; *) return 1 ;; esac
 }
 
-# Parse TCP receiver line from server output:
-# Returns: transfer_bytes,bitrate_bps
-parse_tcp_receiver_to_csv() {
+# UDP receiver line parse -> returns:
+# server_bitrate_bps,server_jitter_ms,server_lost,server_total,server_loss_percent
+parse_udp_receiver_line_to_csv() {
   local raw_file="$1"
   python3 - "$raw_file" <<'PY'
 import re, sys
@@ -98,35 +96,56 @@ for line in lines:
         recv = line
 
 if not recv:
-    print(",")  # transfer_bytes,bitrate_bps
+    print(",,,,")
     sys.exit(0)
 
-# Typical TCP receiver summary:
-# [  5]   0.00-10.00  sec  2.68 GBytes  2.30 Gbits/sec                  receiver
-m = re.search(r'\s([\d.]+)\s*([KMG]?Bytes)\s+([\d.]+)\s*([KMG]?bits/sec)\s+.*receiver$', recv)
+# Example UDP receiver summary:
+# [  6]   0.00-10.00  sec  2.68 GBytes  2.30 Gbits/sec  0.001 ms  157940/2970119 (5.3%)  receiver
+m = re.search(r'\s([\d.]+)\s*([KMG]?bits/sec)\s+([\d.]+)\s*ms\s+(\d+)\s*/\s*(\d+)\s*\(([\d.]+)%\)', recv)
 if not m:
-    print(",")
+    print(",,,,")
     sys.exit(0)
 
-t_val = float(m.group(1))
-t_unit = m.group(2)
-b_val = float(m.group(3))
-b_unit = m.group(4)
+val = float(m.group(1))
+unit = m.group(2)
+jitter = m.group(3)
+lost = m.group(4)
+total = m.group(5)
+loss = m.group(6)
 
-t_mul = 1.0
-if t_unit.startswith("K"): t_mul = 1e3
-elif t_unit.startswith("M"): t_mul = 1e6
-elif t_unit.startswith("G"): t_mul = 1e9
+mul = 1.0
+if unit.startswith("K"): mul = 1e3
+elif unit.startswith("M"): mul = 1e6
+elif unit.startswith("G"): mul = 1e9
 
-b_mul = 1.0
-if b_unit.startswith("K"): b_mul = 1e3
-elif b_unit.startswith("M"): b_mul = 1e6
-elif b_unit.startswith("G"): b_mul = 1e9
-
-transfer_bytes = t_val * t_mul
-bitrate_bps = b_val * b_mul
-print(f"{transfer_bytes},{bitrate_bps}")
+bps = val * mul
+print(f"{bps},{jitter},{lost},{total},{loss}")
 PY
+}
+
+kill_all_iperf3() {
+  echo "[prep] Killing any running iperf3 and freeing port $PORT (best effort)..."
+
+  sudo pkill -9 iperf3 2>/dev/null || true
+
+  if command -v fuser >/dev/null 2>&1; then
+    sudo fuser -k -n tcp "$PORT" 2>/dev/null || true
+    sudo fuser -k -n udp "$PORT" 2>/dev/null || true
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    local pids
+    pids="$(sudo lsof -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "${pids:-}" ]]; then
+      echo "[prep] Killing LISTEN pids on tcp/$PORT: $pids"
+      sudo kill -9 $pids 2>/dev/null || true
+    fi
+  fi
+
+  echo "[prep] Current listeners on :$PORT (tcp/udp):"
+  sudo ss -ltnp "( sport = :$PORT )" 2>/dev/null || true
+  sudo ss -lunp "( sport = :$PORT )" 2>/dev/null || true
+  echo "[prep] Done."
 }
 
 auth_clean_only() {
@@ -140,49 +159,16 @@ auth_clean_only() {
   sudo pkill -f af_reinject 2>/dev/null || true
 }
 
-# IMPORTANT: your config.sh installs UDP flower filters.
-# For TCP tests, we override those tc filters to ip_proto tcp.
-install_tcp_filters_override() {
-  local host_ip="$1"
-  local peer_ip="$2"
-
-  echo "[auth_on] Overriding tc filters to TCP (port ${PORT}) on ${IFACE}"
-  echo "          HOST_IP=${host_ip} PEER_IP=${peer_ip}"
-
-  # EGRESS (HOST -> PEER): mirror+drop ONLY DSCP=0 originals
-  sudo tc filter replace dev "$IFACE" egress pref 100 protocol ip \
-    flower skip_hw ip_proto tcp \
-    src_ip "$host_ip" dst_ip "$peer_ip" dst_port "$PORT" \
-    ip_tos 0x00/0xFC \
-    action mirred egress mirror dev ifb0 pipe \
-    action gact drop
-
-  # INGRESS (PEER -> HOST): mirror+drop ALL (captures reinjected DSCP=EF too)
-  sudo tc filter replace dev "$IFACE" ingress pref 200 protocol ip \
-    flower skip_hw ip_proto tcp \
-    src_ip "$peer_ip" src_port "$PORT" dst_ip "$host_ip" \
-    action mirred egress mirror dev ifb0 pipe \
-    action gact drop
-
-  echo "[auth_on] tc filters (ingress):"
-  sudo tc -s filter show dev "$IFACE" ingress || true
-  echo "[auth_on] tc filters (egress):"
-  sudo tc -s filter show dev "$IFACE" egress || true
-}
-
 auth_start_on_this_node() {
   local host_ip="$1"
-  local peer_ip="$2"
 
   [[ -x ./config.sh ]] || { echo "ERROR: ./config.sh not found or not executable"; exit 1; }
 
   echo "[auth_on] sudo ./config.sh host"
   sudo ./config.sh host
 
-  # Override UDP tc rules with TCP ones
-  install_tcp_filters_override "$host_ip" "$peer_ip"
-
-  [[ -f makefile ]] || { echo "ERROR: Makefile not found (needed to start af_reinject via make run_both_*)"; exit 1; }
+  # Your repo uses lowercase makefile
+  [[ -f makefile ]] || { echo "ERROR: makefile not found (needed to start af_reinject via make run_both_*)"; exit 1; }
   need_cmd make
 
   if [[ "$host_ip" == "192.168.100.1" ]]; then
@@ -197,27 +183,38 @@ auth_start_on_this_node() {
   fi
 }
 
-server_marker_capture() {
-  # Capture a few packets on server to "mark" traffic windows (TCP).
+start_server_pcap_capture() {
   local outdir="$1"
-  local run="$2"
-  local sz="$3"
+  local pcap="${outdir}/udp_traffic.pcap"
+  local pidfile="${outdir}/tcpdump.pid"
 
-  need_cmd tcpdump
+  if ! command -v tcpdump >/dev/null 2>&1; then
+    echo "[server] tcpdump not found; skipping pcap capture."
+    return 0
+  fi
 
-  local mdir="${outdir}/markers"
-  mkdir -p "$mdir"
+  echo "[server] Starting tcpdump capture -> $pcap"
+  # Capture UDP port traffic on IFACE; keep it lightweight.
+  sudo tcpdump -ni "$IFACE" "udp port $PORT" -w "$pcap" >/dev/null 2>&1 &
+  echo $! | sudo tee "$pidfile" >/dev/null
+}
 
-  local pcap="${mdir}/run_${run}_sz_${sz}.pcap"
-  local txt="${mdir}/run_${run}_sz_${sz}.txt"
+stop_server_pcap_capture() {
+  local outdir="$1"
+  local pidfile="${outdir}/tcpdump.pid"
 
-  sudo timeout 3 tcpdump -ni "$IFACE" tcp port "$PORT" -c 20 -w "$pcap" >/dev/null 2>&1 || true
-  sudo tcpdump -nn -tt -vv -r "$pcap" > "$txt" 2>/dev/null || true
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid="$(sudo cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "${pid:-}" ]]; then
+      echo "[server] Stopping tcpdump pid=$pid"
+      sudo kill "$pid" 2>/dev/null || true
+    fi
+  fi
 }
 
 run_server_mode() {
-  local label="$1" host_ip="$2"
-  local stamp="$3"
+  local label="$1" host_ip="$2" stamp="$3"
   local outdir="results/${label}/${IFACE}/iperf3/${stamp}"
   mkdir -p "$outdir"
 
@@ -229,29 +226,29 @@ run_server_mode() {
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "TCP mode"
-    echo "fixed: duration=${DURATION_SEC}s bandwidth_label=${BANDWIDTH_LABEL}"
-    echo "parallel_streams=${PARALLEL_STREAMS}"
+    echo "UDP mode"
+    echo "fixed: duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
     echo "sizes=${SIZES[*]}"
   } > "${outdir}/meta_server.txt"
 
   local logfile="${outdir}/iperf3_server.log"
 
   echo
-  echo "== SERVER MODE (TCP) =="
+  echo "== SERVER MODE (UDP) =="
   echo "Run folder: $outdir"
   echo "Logging server output to: $logfile"
   echo "Listening on: ${host_ip}:${PORT}"
   echo "Stop with Ctrl+C after sender finishes."
   echo
 
+  start_server_pcap_capture "$outdir"
+  trap 'stop_server_pcap_capture "$outdir"' EXIT
+
   sudo iperf3 -s -p "$PORT" --logfile "$logfile"
 }
 
 run_sender_mode() {
-  local label="$1" host_ip="$2" peer_ip="$3"
-  local stamp="$4"
-  local runs="$5"
+  local label="$1" host_ip="$2" peer_ip="$3" stamp="$4" runs="$5"
   local outdir="results/${label}/${IFACE}/iperf3/${stamp}"
   mkdir -p "$outdir"
 
@@ -264,22 +261,21 @@ run_sender_mode() {
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "TCP mode"
-    echo "fixed: duration=${DURATION_SEC}s bandwidth_label=${BANDWIDTH_LABEL}"
+    echo "UDP mode"
+    echo "fixed: duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
     echo "runs=${runs}"
-    echo "parallel_streams=${PARALLEL_STREAMS}"
     echo "sizes=${SIZES[*]}"
   } > "${outdir}/meta_sender.txt"
 
   local csv="${outdir}/results.csv"
   : > "$csv"
-  echo "timestamp,run_index,msg_size_bytes,parallel_streams,duration_sec,transfer_bytes,server_bitrate_bps" >> "$csv"
+  echo "timestamp,run_index,msg_size_bytes,bandwidth_arg,server_bitrate_bps,server_jitter_ms,server_lost,server_total,server_loss_percent" >> "$csv"
 
   echo
-  echo "== SENDER MODE (TCP) =="
+  echo "== SENDER MODE (UDP) =="
   echo "Run folder: $outdir"
   echo "Target: ${peer_ip}:${PORT}"
-  echo "Params: runs=${runs} duration=${DURATION_SEC}s parallel=${PARALLEL_STREAMS} (bandwidth_label=${BANDWIDTH_LABEL}, TCP ignores -b)"
+  echo "Params: runs=${runs} duration=${DURATION_SEC}s bandwidth=${BANDWIDTH}"
   echo
 
   for run in $(seq 1 "$runs"); do
@@ -290,22 +286,21 @@ run_sender_mode() {
       local raw="${logdir}/iperf3_raw.txt"
 
       {
-        echo "cmd: iperf3 -c $peer_ip -p $PORT --cport $PORT -l $sz -t $DURATION_SEC -P $PARALLEL_STREAMS --get-server-output"
+        echo "cmd: iperf3 -c $peer_ip -p $PORT -u --cport $PORT -l $sz -t $DURATION_SEC -b $BANDWIDTH --get-server-output"
         echo "start_ts: $(date +%s)"
       } > "${logdir}/meta.txt"
 
-      # TCP client -> server. Keep --cport=PORT to keep 9999 source port for tc ingress match.
-      if ! iperf3 -c "$peer_ip" -p "$PORT" \
+      if ! iperf3 -c "$peer_ip" -p "$PORT" -u \
           --cport "$PORT" \
-          -l "$sz" -t "$DURATION_SEC" -P "$PARALLEL_STREAMS" \
+          -l "$sz" -t "$DURATION_SEC" -b "$BANDWIDTH" \
           --get-server-output \
           >"$raw" 2>&1; then
         echo "[warn] iperf3 failed (run=$run size=$sz). See: $raw"
       fi
 
       local ts; ts="$(date +%s)"
-      local parsed; parsed="$(parse_tcp_receiver_to_csv "$raw")"  # transfer_bytes,bitrate_bps
-      echo "${ts},${run},${sz},${PARALLEL_STREAMS},${DURATION_SEC},${parsed}" >> "$csv"
+      local parsed; parsed="$(parse_udp_receiver_line_to_csv "$raw")"
+      echo "${ts},${run},${sz},${BANDWIDTH},${parsed}" >> "$csv"
     done
   done
 
@@ -315,35 +310,9 @@ run_sender_mode() {
   echo "Raw logs: $outdir/run_*/sz_*/iperf3_raw.txt"
 }
 
-kill_all_iperf3() {
-  echo "[prep] Killing any running iperf3 (best effort)..."
-
-  # Kill any iperf3 process
-  sudo pkill -9 iperf3 2>/dev/null || true
-
-  # Kill anything holding our port (TCP)
-  if command -v fuser >/dev/null 2>&1; then
-    sudo fuser -k -n tcp "$PORT" 2>/dev/null || true
-  fi
-
-  # Fallback: lsof
-  if command -v lsof >/dev/null 2>&1; then
-    local pids
-    pids="$(sudo lsof -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
-    if [[ -n "${pids:-}" ]]; then
-      echo "[prep] Killing LISTEN pids on tcp/$PORT: $pids"
-      sudo kill -9 $pids 2>/dev/null || true
-    fi
-  fi
-
-  echo "[prep] Done. Current listeners on tcp/$PORT:"
-  sudo ss -ltnp "( sport = :$PORT )" 2>/dev/null || true
-}
-
-
 main() {
   echo "IFACE=$IFACE PORT=$PORT"
-  echo "TCP: duration=${DURATION_SEC}s bandwidth_label=${BANDWIDTH_LABEL} parallel=${PARALLEL_STREAMS} sizes=${SIZES[*]}"
+  echo "UDP: duration=${DURATION_SEC}s bandwidth=$BANDWIDTH sizes=${SIZES[*]}"
   echo
 
   local host_ip; host_ip="$(get_iface_ipv4 "$IFACE" || true)"
@@ -368,17 +337,16 @@ main() {
   kill_all_iperf3
 
   if [[ "$label" == "auth_on" ]]; then
-    auth_start_on_this_node "$host_ip" "$peer_ip"
+    auth_start_on_this_node "$host_ip"
   else
     auth_clean_only
   fi
 
   if [[ "$role" == "server" ]]; then
     run_server_mode "$label" "$host_ip" "$stamp"
-    exit 0
+  else
+    run_sender_mode "$label" "$host_ip" "$peer_ip" "$stamp" "$runs"
   fi
-
-  run_sender_mode "$label" "$host_ip" "$peer_ip" "$stamp" "$runs"
 }
 
 main "$@"
