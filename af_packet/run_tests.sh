@@ -182,7 +182,7 @@ auth_start_on_this_node() {
   # Override UDP tc rules with TCP ones
   install_tcp_filters_override "$host_ip" "$peer_ip"
 
-  [[ -f Makefile ]] || { echo "ERROR: Makefile not found (needed to start af_reinject via make run_both_*)"; exit 1; }
+  [[ -f makefile ]] || { echo "ERROR: Makefile not found (needed to start af_reinject via make run_both_*)"; exit 1; }
   need_cmd make
 
   if [[ "$host_ip" == "192.168.100.1" ]]; then
