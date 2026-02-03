@@ -26,16 +26,13 @@ BANDWIDTH="100G"
 SIZES=(128 256 512 1024 2048 4096 8192)
 
 # rtt test params
-RTT_TIMEOUT_SEC="${RTT_TIMEOUT_SEC:-1.0}"
+RTT_TIMEOUT_SEC="${RTT_TIMEOUT_SEC:-0.5}"   # per-probe timeout (seconds)
 # --------------------------------------
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not found"; exit 1; }; }
 need_cmd ip
 need_cmd python3
 need_cmd date
-
-# iperf3 only needed for bandwidth test
-# tcpdump optional
 
 ts_folder() { date +"%Y%m%d_%H%M%S"; }
 
@@ -109,8 +106,6 @@ if not recv:
     print(",,,,")
     sys.exit(0)
 
-# Example UDP receiver summary:
-# [  6]   0.00-10.00  sec  2.68 GBytes  2.30 Gbits/sec  0.001 ms  157940/2970119 (5.3%)  receiver
 m = re.search(r'\s([\d.]+)\s*([KMG]?bits/sec)\s+([\d.]+)\s*ms\s+(\d+)\s*/\s*(\d+)\s*\(([\d.]+)%\)', recv)
 if not m:
     print(",,,,")
@@ -139,7 +134,7 @@ PY
 udp_rtt_probe_to_csv() {
   local host_ip="$1" peer_ip="$2" size="$3" raw_out="$4"
   python3 - "$host_ip" "$peer_ip" "$PORT" "$PORT" "$size" "$RTT_TIMEOUT_SEC" "$raw_out" <<'PY'
-import os, socket, sys, time, secrets, struct
+import secrets, socket, struct, sys, time
 
 # argv: host_ip peer_ip dst_port src_port payload_size timeout_sec raw_out_path
 host_ip = sys.argv[1]
@@ -150,14 +145,11 @@ payload_size = int(sys.argv[5])
 timeout_s = float(sys.argv[6])
 raw_path = sys.argv[7]
 
-t0 = time.time()
-
-# Small header so we can sanity-check echo
+# 8-byte nonce + 8-byte timestamp so we can sanity-check echoes
 nonce = secrets.token_bytes(8)
-send_ts_ns = time.time_ns()
-hdr = nonce + struct.pack("!Q", send_ts_ns)
+send_t_ns = time.perf_counter_ns()
+hdr = nonce + struct.pack("!Q", send_t_ns)
 
-# payload_size is TOTAL UDP payload bytes we send (including hdr)
 if payload_size < len(hdr):
     payload = hdr[:payload_size]
 else:
@@ -166,16 +158,16 @@ else:
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(timeout_s)
 
-# bind to fixed source port for tc ingress matching (src_port == PORT)
+# bind fixed src port (PORT) so tc/af_reinject match keeps working
 sock.bind((host_ip, src_port))
 
 try:
     sock.sendto(payload, (peer_ip, dst_port))
     data, addr = sock.recvfrom(65535)
-    t1 = time.time()
+    recv_t_ns = time.perf_counter_ns()
 
     ok = (len(data) >= 8 and data[:8] == nonce)
-    rtt_ms = (t1 - t0) * 1000.0
+    rtt_ms = (recv_t_ns - send_t_ns) / 1e6
 
     with open(raw_path, "w") as f:
         f.write("udp_rtt_probe\n")
@@ -188,7 +180,7 @@ try:
         f.write(f"nonce_ok={ok}\n")
         f.write(f"rtt_ms={rtt_ms:.6f}\n")
 
-    # Print CSV fields: rtt_ms,timeout_flag
+    # CSV fields: rtt_ms,timeout_flag
     print(f"{rtt_ms:.6f},0")
 
 except socket.timeout:
@@ -233,19 +225,22 @@ run_rtt_server_mode() {
   echo "Stop with Ctrl+C after sender finishes."
   echo
 
-  # Foreground UDP echo server (prints a marker containing 'udp_echo_server' so pkill can find it)
-  python3 -u -c '
-import socket, sys, time
+  python3 -u - "$host_ip" "$PORT" 2>&1 | tee "$logfile" <<'PY'
+import socket, sys
 host_ip = sys.argv[1]
 port = int(sys.argv[2])
+
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 sock.bind((host_ip, port))
+
 print("udp_echo_server ready", flush=True)
 print(f"listening {host_ip}:{port}", flush=True)
+
 while True:
     data, addr = sock.recvfrom(65535)
     sock.sendto(data, addr)
-' "$host_ip" "$PORT" 2>&1 | tee "$logfile"
+PY
 }
 
 run_rtt_sender_mode() {
@@ -289,12 +284,9 @@ run_rtt_sender_mode() {
       local raw="${logdir}/rtt_raw.txt"
       local ts; ts="$(date +%s)"
 
-      # prints "rtt_ms,timeout_flag"
       local parsed
       parsed="$(udp_rtt_probe_to_csv "$host_ip" "$peer_ip" "$sz" "$raw" || true)"
-      if [[ -z "${parsed:-}" ]]; then
-        parsed=",1"
-      fi
+      [[ -n "${parsed:-}" ]] || parsed=",1"
 
       echo "${ts},${run},${sz},${parsed}" >> "$csv"
     done
@@ -316,15 +308,6 @@ kill_all_iperf3() {
   if command -v fuser >/dev/null 2>&1; then
     sudo fuser -k -n tcp "$PORT" 2>/dev/null || true
     sudo fuser -k -n udp "$PORT" 2>/dev/null || true
-  fi
-
-  if command -v lsof >/dev/null 2>&1; then
-    local pids
-    pids="$(sudo lsof -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
-    if [[ -n "${pids:-}" ]]; then
-      echo "[prep] Killing LISTEN pids on tcp/$PORT: $pids"
-      sudo kill -9 $pids 2>/dev/null || true
-    fi
   fi
 
   echo "[prep] Current listeners on :$PORT (tcp/udp):"
@@ -352,7 +335,6 @@ auth_start_on_this_node() {
   echo "[auth_on] sudo ./config.sh host"
   sudo ./config.sh host
 
-  # Your repo uses lowercase makefile
   [[ -f makefile ]] || { echo "ERROR: makefile not found (needed to start af_reinject via make run_both_*)"; exit 1; }
   need_cmd make
 
@@ -365,35 +347,6 @@ auth_start_on_this_node() {
   else
     echo "ERROR: host_ip '$host_ip' not recognized for our setup"
     exit 1
-  fi
-}
-
-start_server_pcap_capture() {
-  local outdir="$1"
-  local pcap="${outdir}/udp_traffic.pcap"
-  local pidfile="${outdir}/tcpdump.pid"
-
-  if ! command -v tcpdump >/dev/null 2>&1; then
-    echo "[server] tcpdump not found; skipping pcap capture."
-    return 0
-  fi
-
-  echo "[server] Starting tcpdump capture -> $pcap"
-  sudo tcpdump -ni "$IFACE" "udp port $PORT" -w "$pcap" >/dev/null 2>&1 &
-  echo $! | sudo tee "$pidfile" >/dev/null
-}
-
-stop_server_pcap_capture() {
-  local outdir="$1"
-  local pidfile="${outdir}/tcpdump.pid"
-
-  if [[ -f "$pidfile" ]]; then
-    local pid
-    pid="$(sudo cat "$pidfile" 2>/dev/null || true)"
-    if [[ -n "${pid:-}" ]]; then
-      echo "[server] Stopping tcpdump pid=$pid"
-      sudo kill "$pid" 2>/dev/null || true
-    fi
   fi
 }
 
@@ -425,9 +378,6 @@ run_server_mode() {
   echo "Listening on: ${host_ip}:${PORT}"
   echo "Stop with Ctrl+C after sender finishes."
   echo
-
-  start_server_pcap_capture "$outdir"
-  trap 'stop_server_pcap_capture "$outdir"' EXIT
 
   sudo iperf3 -s -p "$PORT" --logfile "$logfile"
 }
@@ -528,9 +478,7 @@ main() {
     fi
   fi
 
-  # Only require iperf3 if bandwidth test was chosen
   need_iperf3_if_bandwidth
-
   kill_all_iperf3
 
   if [[ "$label" == "auth_on" ]]; then
@@ -540,7 +488,7 @@ main() {
   fi
 
   if [[ "$TEST_KIND" == "bandwidth" ]]; then
-    # IMPORTANT: bandwidth folder structure unchanged
+    # bandwidth folder structure unchanged
     if [[ "$role" == "server" ]]; then
       run_server_mode "$label" "$host_ip" "$stamp"
     else
@@ -549,7 +497,7 @@ main() {
     exit 0
   fi
 
-  # RTT mode (new /rtt/<ts>/run_... structure)
+  # RTT mode
   if [[ "$role" == "server" ]]; then
     run_rtt_server_mode "$label" "$host_ip" "$stamp"
   else
