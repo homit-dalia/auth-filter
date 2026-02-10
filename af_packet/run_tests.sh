@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_iperf_global.sh (UDP)
-# - auth ON:   config.sh host + make run_both_* + (bandwidth: iperf3) OR (rtt: udp echo)
-# - auth OFF:  config.sh clean (no make) + (bandwidth: iperf3) OR (rtt: udp echo)
+# - auth ON:   config.sh host + make run_both_* + (bandwidth: iperf3) OR (rtt: sockperf)
+# - auth OFF:  config.sh clean (no make) + (bandwidth: iperf3) OR (rtt: sockperf)
 #
 # One run folder per invocation (timestamped) containing all logs/results for that role.
 # RUNS is user input (sender mode).
@@ -9,7 +9,7 @@
 # BANDWIDTH TEST (unchanged structure):
 #   results/<auth>/<iface>/iperf3/<ts>/...
 #
-# RTT TEST (new structure):
+# RTT TEST (sockperf, structure unchanged):
 #   results/<auth>/<iface>/rtt/<ts>/results.csv
 #   results/<auth>/<iface>/rtt/<ts>/run_<n>/sz_<size>/rtt_raw.txt
 
@@ -23,10 +23,12 @@ PORT="${PORT:-9999}"
 # bandwidth test params (unchanged)
 DURATION_SEC=10
 BANDWIDTH="100G"
-SIZES=(128 256 512 1024 2048 4096 8192)
 
-# rtt test params
-RTT_TIMEOUT_SEC="${RTT_TIMEOUT_SEC:-0.5}"   # per-probe timeout (seconds)
+# RTT + bandwidth sizes (updated per request)
+SIZES=(32 128 512 1024 2048 4096 8192)
+
+# RTT sockperf params
+SOCKPERF_TIME_SEC=10
 # --------------------------------------
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: '$1' not found"; exit 1; }; }
@@ -62,6 +64,18 @@ ask_choice() {
     fi
     echo "Invalid. Choose one of: $valid"
   done
+}
+
+ask_int_allow_zero() {
+  # 0 means "no override"
+  local prompt="$1" def="$2" ans
+  read -r -p "$prompt [$def]: " ans || ans=""
+  ans="${ans:-$def}"
+  if ! [[ "$ans" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: expected integer >= 0, got '$ans'"
+    exit 1
+  fi
+  echo "$ans"
 }
 
 ask_int() {
@@ -129,73 +143,112 @@ PY
 }
 # --------------------------------------------------------------------------
 
-# ---------------- RTT (UDP echo) helpers (NEW) ----------------
-# Returns: rtt_ms,timeout_flag(0/1)
-udp_rtt_probe_to_csv() {
-  local host_ip="$1" peer_ip="$2" size="$3" raw_out="$4"
-  python3 - "$host_ip" "$peer_ip" "$PORT" "$PORT" "$size" "$RTT_TIMEOUT_SEC" "$raw_out" <<'PY'
-import secrets, socket, struct, sys, time
+# ---------------- RTT (sockperf full RTT) helpers (NEW) ----------------
+need_sockperf_if_rtt() {
+  if [[ "${TEST_KIND:-}" == "rtt" ]]; then
+    need_cmd sockperf
+  fi
+}
 
-# argv: host_ip peer_ip dst_port src_port payload_size timeout_sec raw_out_path
-host_ip = sys.argv[1]
-peer_ip = sys.argv[2]
-dst_port = int(sys.argv[3])
-src_port = int(sys.argv[4])
-payload_size = int(sys.argv[5])
-timeout_s = float(sys.argv[6])
-raw_path = sys.argv[7]
+# Parse sockperf output to CSV fields:
+# rtt_min_us,rtt_avg_us,rtt_p50_us,rtt_p99_us,rtt_max_us,timeout_flag
+#
+# We treat "timeout_flag" as 1 if the command failed or we couldn't parse.
+parse_sockperf_to_csv() {
+  local raw_file="$1"
+  python3 - "$raw_file" <<'PY'
+import re, sys
 
-# 8-byte nonce + 8-byte timestamp so we can sanity-check echoes
-nonce = secrets.token_bytes(8)
-send_t_ns = time.perf_counter_ns()
-hdr = nonce + struct.pack("!Q", send_t_ns)
+p = sys.argv[1]
+txt = open(p, "r", errors="ignore").read()
 
-if payload_size < len(hdr):
-    payload = hdr[:payload_size]
-else:
-    payload = hdr + b"\x00" * (payload_size - len(hdr))
+# Common sockperf ping-pong summary patterns vary by version.
+# We'll try multiple regexes for min/avg/max and percentiles.
+def f(s):
+    try:
+        return float(s)
+    except:
+        return None
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.settimeout(timeout_s)
+min_v = avg_v = max_v = None
+p50 = p99 = None
 
-# bind fixed src port (PORT) so tc/af_reinject match keeps working
-sock.bind((host_ip, src_port))
+# Pattern A: "min/avg/max = X / Y / Z"
+m = re.search(r'\bmin\s*/\s*avg\s*/\s*max\s*=\s*([\d.]+)\s*/\s*([\d.]+)\s*/\s*([\d.]+)', txt, re.I)
+if m:
+    min_v, avg_v, max_v = map(f, m.groups())
 
-try:
-    sock.sendto(payload, (peer_ip, dst_port))
-    data, addr = sock.recvfrom(65535)
-    recv_t_ns = time.perf_counter_ns()
+# Pattern B: separate lines like "min: X" "avg: Y" "max: Z"
+if min_v is None:
+    m = re.search(r'\bmin(?:imum)?\s*[:=]\s*([\d.]+)', txt, re.I)
+    if m: min_v = f(m.group(1))
+if avg_v is None:
+    m = re.search(r'\bavg(?:erage)?\s*[:=]\s*([\d.]+)', txt, re.I)
+    if m: avg_v = f(m.group(1))
+if max_v is None:
+    m = re.search(r'\bmax(?:imum)?\s*[:=]\s*([\d.]+)', txt, re.I)
+    if m: max_v = f(m.group(1))
 
-    ok = (len(data) >= 8 and data[:8] == nonce)
-    rtt_ms = (recv_t_ns - send_t_ns) / 1e6
+# Percentiles: "50.000%  X" or "percentile 50.00: X"
+m = re.search(r'\b50(?:\.0+)?%\s+([\d.]+)', txt)
+if m: p50 = f(m.group(1))
+if p50 is None:
+    m = re.search(r'\b(?:p50|50th)\b.*?([\d.]+)', txt, re.I)
+    if m: p50 = f(m.group(1))
 
-    with open(raw_path, "w") as f:
-        f.write("udp_rtt_probe\n")
-        f.write(f"host_ip={host_ip}\npeer_ip={peer_ip}\n")
-        f.write(f"src_port={src_port}\ndst_port={dst_port}\n")
-        f.write(f"payload_size={payload_size}\n")
-        f.write(f"timeout_s={timeout_s}\n")
-        f.write(f"recv_from={addr}\n")
-        f.write(f"recv_len={len(data)}\n")
-        f.write(f"nonce_ok={ok}\n")
-        f.write(f"rtt_ms={rtt_ms:.6f}\n")
+m = re.search(r'\b99(?:\.0+)?%\s+([\d.]+)', txt)
+if m: p99 = f(m.group(1))
+if p99 is None:
+    m = re.search(r'\b(?:p99|99th)\b.*?([\d.]+)', txt, re.I)
+    if m: p99 = f(m.group(1))
 
-    # CSV fields: rtt_ms,timeout_flag
-    print(f"{rtt_ms:.6f},0")
+# If we found avg but units might be "usec" already.
+# We'll assume values are microseconds (sockperf typically reports usec).
+vals = [min_v, avg_v, p50, p99, max_v]
+ok = all(v is not None for v in [min_v, avg_v, max_v])
 
-except socket.timeout:
-    with open(raw_path, "w") as f:
-        f.write("udp_rtt_probe\n")
-        f.write(f"host_ip={host_ip}\npeer_ip={peer_ip}\n")
-        f.write(f"src_port={src_port}\ndst_port={dst_port}\n")
-        f.write(f"payload_size={payload_size}\n")
-        f.write(f"timeout_s={timeout_s}\n")
-        f.write("timeout=1\n")
-    print(",1")
+if not ok:
+    print(",,,,,,1")
+    sys.exit(0)
 
-finally:
-    sock.close()
+def fmt(x):
+    return "" if x is None else f"{x:.3f}"
+
+print(f"{fmt(min_v)},{fmt(avg_v)},{fmt(p50)},{fmt(p99)},{fmt(max_v)},0")
 PY
+}
+
+run_sockperf_pingpong_once() {
+  # prints CSV row fields: min_us,avg_us,p50_us,p99_us,max_us,timeout
+  local host_ip="$1" peer_ip="$2" size="$3" raw_out="$4"
+  local tmp="${raw_out}.tmp"
+
+  # sockperf client (sender)
+  # -i peer, -p port, --full-rtt, -m msg size, -t test time, --src-port keep tc matching stable
+  # Some sockperf builds use "--src-port" and some use "--sender-port".
+  # We'll try --src-port first, fall back to --sender-port if needed.
+  {
+    echo "sockperf ping-pong --full-rtt -i ${peer_ip} -p ${PORT} -m ${size} -t ${SOCKPERF_TIME_SEC} --src-port ${PORT}"
+    echo "host_ip=${host_ip} peer_ip=${peer_ip} port=${PORT} msg_size=${size} time_sec=${SOCKPERF_TIME_SEC}"
+    echo "-----"
+  } > "$raw_out"
+
+  if sockperf ping-pong --full-rtt -i "$peer_ip" -p "$PORT" -m "$size" -t "$SOCKPERF_TIME_SEC" --src-port "$PORT" >>"$raw_out" 2>&1; then
+    :
+  else
+    # fallback flag name
+    if sockperf ping-pong --full-rtt -i "$peer_ip" -p "$PORT" -m "$size" -t "$SOCKPERF_TIME_SEC" --sender-port "$PORT" >>"$raw_out" 2>&1; then
+      :
+    else
+      echo ",,,,,,1"
+      return 0
+    fi
+  fi
+
+  local parsed
+  parsed="$(parse_sockperf_to_csv "$raw_out" || true)"
+  [[ -n "${parsed:-}" ]] || parsed=",,,,,,1"
+  echo "$parsed"
 }
 
 run_rtt_server_mode() {
@@ -206,51 +259,40 @@ run_rtt_server_mode() {
   {
     echo "role=server"
     echo "test=rtt"
+    echo "tool=sockperf"
     echo "auth=${label}"
     echo "iface=${IFACE}"
     echo "host_ip=${host_ip}"
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "UDP echo server for RTT"
+    echo "sockperf server (sr)"
   } > "${outdir}/meta_server.txt"
 
-  local logfile="${outdir}/udp_echo_server.log"
+  local logfile="${outdir}/sockperf_server.log"
 
   echo
-  echo "== SERVER MODE (RTT / UDP echo) =="
+  echo "== SERVER MODE (RTT / sockperf sr) =="
   echo "Run folder: $outdir"
   echo "Logging server output to: $logfile"
   echo "Listening on: ${host_ip}:${PORT}"
   echo "Stop with Ctrl+C after sender finishes."
   echo
 
-  python3 -u - "$host_ip" "$PORT" 2>&1 | tee "$logfile" <<'PY'
-import socket, sys
-host_ip = sys.argv[1]
-port = int(sys.argv[2])
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind((host_ip, port))
-
-print("udp_echo_server ready", flush=True)
-print(f"listening {host_ip}:{port}", flush=True)
-
-while True:
-    data, addr = sock.recvfrom(65535)
-    sock.sendto(data, addr)
-PY
+  # Run sockperf server bound to host_ip
+  # Some versions use "-i" to bind. We keep it explicit.
+  sockperf sr -i "$host_ip" -p "$PORT" 2>&1 | tee "$logfile"
 }
 
 run_rtt_sender_mode() {
-  local label="$1" host_ip="$2" peer_ip="$3" stamp="$4" runs="$5"
+  local label="$1" host_ip="$2" peer_ip="$3" stamp="$4" runs_default="$5" runs_override="$6"
   local outdir="results/${label}/${IFACE}/rtt/${stamp}"
   mkdir -p "$outdir"
 
   {
     echo "role=sender"
     echo "test=rtt"
+    echo "tool=sockperf"
     echo "auth=${label}"
     echo "iface=${IFACE}"
     echo "host_ip=${host_ip}"
@@ -258,37 +300,50 @@ run_rtt_sender_mode() {
     echo "port=${PORT}"
     echo "timestamp=${stamp}"
     echo
-    echo "UDP RTT via echo"
-    echo "runs=${runs}"
+    echo "sockperf ping-pong --full-rtt"
+    echo "runs_default=${runs_default}"
+    echo "runs_override_for_32_1024_8192=${runs_override}"
     echo "sizes=${SIZES[*]}"
-    echo "timeout_sec=${RTT_TIMEOUT_SEC}"
+    echo "time_per_run_sec=${SOCKPERF_TIME_SEC}"
   } > "${outdir}/meta_sender.txt"
 
   local csv="${outdir}/results.csv"
   : > "$csv"
-  echo "timestamp,run_index,msg_size_bytes,rtt_ms,timeout" >> "$csv"
+  echo "timestamp,run_index,msg_size_bytes,tool,time_sec,rtt_min_us,rtt_avg_us,rtt_p50_us,rtt_p99_us,rtt_max_us,timeout" >> "$csv"
 
   echo
-  echo "== SENDER MODE (RTT / UDP echo) =="
+  echo "== SENDER MODE (RTT / sockperf ping-pong --full-rtt) =="
   echo "Run folder: $outdir"
   echo "Target: ${peer_ip}:${PORT}"
-  echo "Params: runs=${runs} timeout=${RTT_TIMEOUT_SEC}s"
+  echo "Time per run: ${SOCKPERF_TIME_SEC}s"
+  echo "Default runs per size: ${runs_default}"
+  if [[ "$runs_override" -gt 0 ]]; then
+    echo "Override runs for sizes {32,1024,8192}: ${runs_override}"
+  fi
   echo
 
-  for run in $(seq 1 "$runs"); do
-    echo "=== Run ${run}/${runs} ==="
-    for sz in "${SIZES[@]}"; do
+  for sz in "${SIZES[@]}"; do
+    local runs_for_size="$runs_default"
+    if [[ "$runs_override" -gt 0 ]]; then
+      if [[ "$sz" == "32" || "$sz" == "1024" || "$sz" == "8192" ]]; then
+        runs_for_size="$runs_override"
+      fi
+    fi
+
+    echo "=== Size ${sz} bytes: ${runs_for_size} runs (each ${SOCKPERF_TIME_SEC}s) ==="
+
+    for run in $(seq 1 "$runs_for_size"); do
       local logdir="${outdir}/run_${run}/sz_${sz}"
       mkdir -p "$logdir"
-
       local raw="${logdir}/rtt_raw.txt"
       local ts; ts="$(date +%s)"
 
       local parsed
-      parsed="$(udp_rtt_probe_to_csv "$host_ip" "$peer_ip" "$sz" "$raw" || true)"
-      [[ -n "${parsed:-}" ]] || parsed=",1"
+      parsed="$(run_sockperf_pingpong_once "$host_ip" "$peer_ip" "$sz" "$raw" || true)"
+      [[ -n "${parsed:-}" ]] || parsed=",,,,,,1"
 
-      echo "${ts},${run},${sz},${parsed}" >> "$csv"
+      # parsed is: min,avg,p50,p99,max,timeout
+      echo "${ts},${run},${sz},sockperf,${SOCKPERF_TIME_SEC},${parsed}" >> "$csv"
     done
   done
 
@@ -300,10 +355,10 @@ run_rtt_sender_mode() {
 # --------------------------------------------------------------------------
 
 kill_all_iperf3() {
-  echo "[prep] Killing any running iperf3 / udp_echo_server and freeing port $PORT (best effort)..."
+  echo "[prep] Killing any running iperf3 / sockperf and freeing port $PORT (best effort)..."
 
   sudo pkill -9 iperf3 2>/dev/null || true
-  sudo pkill -f udp_echo_server 2>/dev/null || true
+  sudo pkill -9 sockperf 2>/dev/null || true
 
   if command -v fuser >/dev/null 2>&1; then
     sudo fuser -k -n tcp "$PORT" 2>/dev/null || true
@@ -447,7 +502,7 @@ run_sender_mode() {
 # -----------------------------------------------------------------------
 
 main() {
-  local role label stamp runs host_ip peer_ip
+  local role label stamp runs runs_override host_ip peer_ip
 
   echo "IFACE=$IFACE PORT=$PORT"
   echo "UDP sizes=${SIZES[*]}"
@@ -470,15 +525,19 @@ main() {
   echo
 
   runs=1
+  runs_override=0
   if [[ "$role" == "sender" ]]; then
     if [[ "$TEST_KIND" == "bandwidth" ]]; then
       runs="$(ask_int "How many runs per msg_size?" "32")"
     else
-      runs="$(ask_int "How many RTT runs per msg_size?" "32")"
+      runs="$(ask_int "How many RTT runs per msg_size (default for all sizes)?" "32")"
+      runs_override="$(ask_int_allow_zero "Override runs for sizes {32,1024,8192}? (0 = no override)" "0")"
     fi
   fi
 
   need_iperf3_if_bandwidth
+  need_sockperf_if_rtt
+
   kill_all_iperf3
 
   if [[ "$label" == "auth_on" ]]; then
@@ -488,7 +547,6 @@ main() {
   fi
 
   if [[ "$TEST_KIND" == "bandwidth" ]]; then
-    # bandwidth folder structure unchanged
     if [[ "$role" == "server" ]]; then
       run_server_mode "$label" "$host_ip" "$stamp"
     else
@@ -497,11 +555,11 @@ main() {
     exit 0
   fi
 
-  # RTT mode
+  # RTT mode (sockperf)
   if [[ "$role" == "server" ]]; then
     run_rtt_server_mode "$label" "$host_ip" "$stamp"
   else
-    run_rtt_sender_mode "$label" "$host_ip" "$peer_ip" "$stamp" "$runs"
+    run_rtt_sender_mode "$label" "$host_ip" "$peer_ip" "$stamp" "$runs" "$runs_override"
   fi
 }
 
