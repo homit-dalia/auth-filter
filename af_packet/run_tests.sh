@@ -219,30 +219,19 @@ PY
 }
 
 run_sockperf_pingpong_once() {
-  # prints CSV row fields: min_us,avg_us,p50_us,p99_us,max_us,timeout
   local host_ip="$1" peer_ip="$2" size="$3" raw_out="$4"
-  local tmp="${raw_out}.tmp"
 
-  # sockperf client (sender)
-  # -i peer, -p port, --full-rtt, -m msg size, -t test time, --src-port keep tc matching stable
-  # Some sockperf builds use "--src-port" and some use "--sender-port".
-  # We'll try --src-port first, fall back to --sender-port if needed.
   {
-    echo "sockperf ping-pong --full-rtt -i ${peer_ip} -p ${PORT} -m ${size} -t ${SOCKPERF_TIME_SEC} --src-port ${PORT}"
+    echo "sockperf ping-pong --full-rtt -i ${peer_ip} -p ${PORT} --client_ip ${host_ip} --client_port ${PORT} -m ${size} -t ${SOCKPERF_TIME_SEC}"
     echo "host_ip=${host_ip} peer_ip=${peer_ip} port=${PORT} msg_size=${size} time_sec=${SOCKPERF_TIME_SEC}"
     echo "-----"
   } > "$raw_out"
 
-  if sockperf ping-pong --full-rtt -i "$peer_ip" -p "$PORT" -m "$size" -t "$SOCKPERF_TIME_SEC" --src-port "$PORT" >>"$raw_out" 2>&1; then
-    :
-  else
-    # fallback flag name
-    if sockperf ping-pong --full-rtt -i "$peer_ip" -p "$PORT" -m "$size" -t "$SOCKPERF_TIME_SEC" --sender-port "$PORT" >>"$raw_out" 2>&1; then
-      :
-    else
-      echo ",,,,,,1"
-      return 0
-    fi
+  if ! sockperf ping-pong --full-rtt -i "$peer_ip" -p "$PORT" \
+        --client_ip "$host_ip" --client_port "$PORT" \
+        -m "$size" -t "$SOCKPERF_TIME_SEC" >>"$raw_out" 2>&1; then
+    echo ",,,,,,1"
+    return 0
   fi
 
   local parsed
